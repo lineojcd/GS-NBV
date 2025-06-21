@@ -1,0 +1,8 @@
+<launch>
+  <!-- abb arm control -->
+  <rosparam file="$(find abb_control)/config/arm_control.yaml" command="load" subst_value="true" />
+
+  <!-- obstacle -->
+  <rosparam file="$(find abb_control)/config/obstacles.yaml" command="load" subst_value="true" />
+  <node name="abb_control" pkg="abb_control" type="arm_control_node" output="screen" />
+</launch>
