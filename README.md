@@ -2,7 +2,7 @@
 This is the offical repository for the CASE 2025 paper: "GS-NBV: a Geometry-based, Semantics-aware Viewpoint Planning Algorithm for Avocado Harvesting under Occlusions"
 
 ### Install
-This project is build on Ubuntu20.04, ROS noetic platform and python 3.8 environment. Please install the platform before any installation steps. When you install ROS, please deactivate conda environment.
+This project is build on Ubuntu20.04, ROS noetic platform and python 3.8 environment. Please install the platform before any installation steps. When you install ROS, please deactivate conda environment. You will also need at least 8GB of GPU VRAM to run this project.
 
 **Create a ROS Workspace**
 ```
