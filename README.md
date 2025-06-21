@@ -48,6 +48,7 @@ cp -r GSNBV/* ~/gsnbv_ws/src
 rm -rf GSNBV
 cd ~/gsnbv_ws/
 catkin build
+# you might need to re-run catkin build multiple times to sucessfully complete the build
 ```
 **Execute**
 ```
