@@ -1,0 +1,34 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="Sketchfab Avocado Tree">
+    <static>true</static>
+    <link name="link">
+      <collision name="collision">
+        <pose>0 0 0.385 0 0 -1.57079632679</pose>
+        <geometry>
+          <mesh>
+            <scale>0.94 0.94 0.94</scale>
+            <!--<scale>0.54 0.54 0.54</scale>-->
+            <!--<scale>0.24 0.24 0.24</scale>-->
+            <uri>/home/jcd/gsnbv_ws/src/simulation_environment/sdfs/avocado_tree_sketchfab/meshes/poly.dae</uri>
+          </mesh>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <pose>0 0 0.385 0 0 -1.57079632679</pose>
+        <geometry>
+          <mesh>
+            <scale>0.94 0.94 0.94</scale>
+            <!--<scale>0.24 0.24 0.24</scale>-->
+            <uri>/home/jcd/gsnbv_ws/src/simulation_environment/sdfs/avocado_tree_sketchfab/meshes/poly.dae</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <!--<transparency>1</transparency>-->
+          <!--<ambient>0.106 0.235 0.141 0.5</ambient>-->
+          <!--<specular>0.2 0.2 0.2 64</specular>-->
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
