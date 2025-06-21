@@ -1,7 +1,25 @@
-# GSNBV
+<p align="center">
+  <h1 align="center">GS-NBV: a Geometry-based, Semantics-aware Viewpoint Planning Algorithm for Avocado Harvesting under Occlusions</h1>
+  <p align="center">
+    <strong>Xiao'ao Song</strong>
+    ·
+    <strong>Konstantinos Karydis</strong>
+  </p>
+</p>
+<h2 align="center">
+  Paper: 
+  <a href="https://arxiv.org/pdf/2311.16759" target="_blank">IEEE</a> | 
+  <a href="https://arxiv.org/pdf/2311.16759" target="_blank">ArXiv</a>
+</h2>
+
+https://github.com/akshaykburusa/gradientnbv/assets/127020264/dfa1f2a9-f07c-4af0-84ef-7ea20a7cb61b
+
+
 This is the offical repository for the CASE 2025 paper: "GS-NBV: a Geometry-based, Semantics-aware Viewpoint Planning Algorithm for Avocado Harvesting under Occlusions"
 
-### Install
+## Installation
+**Prerequisites**
+
 This project is build on Ubuntu20.04, ROS noetic platform and python 3.8 environment. Please install the platform before any installation steps. When you install ROS, please deactivate conda environment. You will also need at least 8GB of GPU VRAM to run this project.
 
 **Create a ROS Workspace**
@@ -50,16 +68,29 @@ cd ~/gsnbv_ws/
 catkin build
 # you might need to re-run catkin build multiple times to sucessfully complete the build
 ```
-**Execute**
+## Execute
+
+Bring up the robot (Kinova robotic arm + Realsense D435i camera):
 ```
-# In the 1st terminal: launch Kinova arm
+# In the 1st terminal: launch Kinova arm.
 roslaunch kinova_gazebo my_robot_launch.launch
-# In the 2nd terminal: launch simulation and run GSNBV algo
+```
+Start the GSNBV planner in a new terminal:
+```
+# In the 2nd terminal: launch simulated avocado tree and run GSNBV algo
 conda activate gsnbv
 roslaunch viewpoint_planning viewpoint_planning.launch
 ```
 ## Citation
+If you use this repository, please cite below:
 ```bibtex
+@article{burusa2023gradient,
+  title={Gradient-based Local Next-best-view Planning for Improved Perception of Targeted Plant Nodes},
+  author={Burusa, Akshay K and van Henten, Eldert J and Kootstra, Gert},
+  journal={arXiv preprint arXiv:2311.16759},
+  year={2024}
+}
+
 @article{burusa2023gradient,
   title={Gradient-based Local Next-best-view Planning for Improved Perception of Targeted Plant Nodes},
   author={Burusa, Akshay K and van Henten, Eldert J and Kootstra, Gert},
