@@ -1,0 +1,695 @@
+"""
+Author: Akshay K. Burusa
+Maintainer: Akshay K. Burusa
+"""
+import rospy
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scene_representation.my_raysampler import MyRaySampler
+from scene_representation.my_raycast_algo_3d import raycast_3d, check_visibility
+from utils.torch_utils import look_at_rotation, transform_from_rotation_translation,get_frustum_points
+
+
+class MyVoxelGrid:
+    """
+    3D representation to store occupancy information and other features (e.g. semantics) over
+    multiple viewpoints
+    """
+    def __init__(
+        self,
+        # grid_center: torch.tensor,
+        intrinsic: torch.tensor,
+        # T_oc: torch.tensor,       #Original: GNBV
+        T_o_pc: torch.tensor,
+        width: int,
+        height: int,
+        # fx: float,
+        # fy: float,
+        # cx: float,
+        # cy: float,
+        # target_position: torch.tensor = None,
+        device: torch.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+    ) -> None:
+        """
+        Constructor
+        :param grid_center: center of the voxel grid (actually the GT or EST. center of the fruit)
+        :param width: image width
+        :param height: image height
+        # :param T_oc: Optical frame to camera frame tansform    #Original: GNBV
+        :param T_o_pc: Optical frame to camera frame tansform
+        # :param fx: focal length along x-axis
+        # :param fy: focal length along y-axis
+        # :param cx: principal point along x-axis
+        # :param cy: principal point along y-axis
+        :param device: device to use for computation
+        """
+        self.device = device
+        self.min_depth = rospy.get_param("near_clipping_plane", "0.03")
+        self.max_depth = rospy.get_param("far_clipping_plane", "0.72")
+        self.fruit_posi_GT = [float(x) for x in rospy.get_param('fruit_posi_GT').split()]
+        self.target_position = torch.tensor(self.fruit_posi_GT, dtype=torch.float32,device=self.device)
+        # grid_range: voxel grid Range, in meters
+        self.grid_range =torch.tensor([float(x) for x in rospy.get_param('grid_range').split()], dtype=torch.float32, device=self.device)
+        self.intrinsic =  intrinsic
+        self.voxel_size = torch.tensor(rospy.get_param("voxel_size", "0.003"), dtype=torch.float32, device=self.device)
+        self.voxel_dims = (self.grid_range / self.voxel_size).long()       # index range of each voxel: voxel_size 0.003
+        rospy.loginfo(f"Effective Octomap range: {self.grid_range}; Total No, of voxels: {self.voxel_dims[0]*self.voxel_dims[1]*self.voxel_dims[2]}")
+        # self.T_oc = T_oc                    #Original: GNBV
+        self.T_o_pc = T_o_pc      
+        self.width = width
+        self.height = height
+        self.num_pts_per_ray = rospy.get_param("num_pts_per_ray", "128")
+        self.num_features_per_voxel = rospy.get_param("num_features_per_voxel", "4")
+        self.eps = torch.tensor(1e-7, dtype=torch.float32,device=self.device)          # epsilon value for numerical stability
+        # print("self.eps is ", self.eps)
+        self.nbv_method = 'mynbv'
+        self.evaluation_metric = rospy.get_param("evaluation_metric")       #semantic_class/coverage
+        # self.init_occ_odds = -0.4                   # log_odds(0.4) = -0.4: assume it is more like to be free
+        self.init_occ_odds = float(rospy.get_param("init_occ_odds", "0.0"))
+        # print("self.init_occ_odds is : ",self.init_occ_odds)
+        self.init_sem_conf_odds = float(rospy.get_param("init_sem_conf_odds", "0.0"))   
+        self.init_sem_cls_id = rospy.get_param("init_sem_cls_id", "-1")             
+        self.voxel_max_fusion_coef = rospy.get_param("voxel_max_fusion_coefficient", "0.9")             
+        self.roi_range = [int(x) for x in rospy.get_param('roi_range').split()]
+        self.voxel_visibility_threshold = rospy.get_param("voxel_visibility_threshold", "0.50") 
+        
+        # self.voxel_center_offset = np.array([0.5, 0.5, 0.5]) 
+        # self.grid_center = grid_center
+        
+        #TODO: origin is related to grid_center and it is related to self.target_position
+        # Can change the self.target_position or better design the origin
+        # Can think this self.origin as the voxel grid coordinates origin 
+        # self.origin = grid_center - self.grid_range / 2.0
+        # for My NBV: designed for my Gaze environment
+        
+        # self.origin = torch.tensor(origin, dtype=torch.float32, device=self.device)
+        self.origin = torch.tensor([float(x) for x in rospy.get_param('voxel_origin').split()], dtype=torch.float32, device=self.device)
+        
+        # TODO: Do not need these parameters for MyNBV
+        self.min_bound = self.origin
+        self.max_bound = self.origin + self.grid_range
+
+        # 4D voxel grid: W*H*D*4: 0 ROIs, 1 occ_prob, 2 sem_conf, 3 sem_class_id
+        self.voxel_grid = torch.zeros(
+            (   self.voxel_dims[0],
+                self.voxel_dims[1],
+                self.voxel_dims[2],
+                self.num_features_per_voxel), 
+            dtype=torch.float32, device=self.device)    # ROI might be: 0 avo; 1 peduncle; 2 contour; 3 envelope
+        
+        # Initialize occupancy probability as 0.5: most uncertain at the beginning 
+        self.voxel_grid[..., 1] = rospy.get_param("init_occ_prob", "0.5") 
+        # Initialize semantic confidence prob close to 0
+        self.voxel_grid[..., 2] = self.eps  
+        # Initialize semantic class to background: -1 background 0 avo; 1 peduncle; 2 contour; 3 envelope
+        self.voxel_grid[..., 3] = self.init_sem_cls_id  
+        
+        # Define regions of interest around the target
+        # TODO: for GNBV, they need to change and update target_position in the init function 
+        # I actually do not need to set_target_roi
+        # if self.nbv_method == 'mynbv':
+        self.set_my_target_roi_region(self.target_position)
+        # else:
+            # self.set_target_roi(self.target_position)
+        
+        # Occupancy probabilities along the ray is initialized to -0.4 
+        ray_occ = self.init_occ_odds * torch.ones((self.num_pts_per_ray, 1),dtype=torch.float32,device=self.device) # dimensions[128, 1]
+        self.ray_occ = ray_occ.unsqueeze(0).repeat(width * height, 1, 1 )       # (W x H, num_pts_per_ray, 1)
+        
+        # Semantic confi along the ray is initialized to 0.2, which gives a log odds of -1.4
+        ray_sem_conf = self.init_sem_conf_odds * torch.ones(self.num_pts_per_ray,dtype=torch.float32,device=self.device)
+        # Semantic id along the ray is initialized to -1 (background)
+        ray_sem_cls = self.init_sem_cls_id * torch.ones(self.num_pts_per_ray,dtype=torch.float32,device=self.device)
+        ray_sem = torch.stack((ray_sem_conf, ray_sem_cls), dim=-1)
+        self.ray_sem = ray_sem.unsqueeze(0).repeat(width * height, 1, 1 )  # (W x H, num_pts_per_ray, 2)
+        self.t_vals = torch.linspace(0.0,1.0,self.num_pts_per_ray,dtype=torch.float32,device=self.device)
+        
+        # self.ray_sampler = MyRaySampler(width=width,height=height,intrinsic=self.intrinsic,device=device)
+
+    def get_occupied_points(self):
+        """
+        Returns the coordinates of the occupied points in the grid
+        :return: tensor of shape (N, 3) containing the coordinates of the occupied points
+        """
+        grid_coords = torch.nonzero(self.voxel_grid[..., 1] > self.voxel_visibility_threshold)
+        # grid_coords = torch.nonzero(self.voxel_grid[..., 1] > 0.4)
+        points = grid_coords * self.voxel_size + self.origin
+        semantics_conf = self.voxel_grid[grid_coords[:, 0], grid_coords[:, 1], grid_coords[:, 2], 2]
+        class_ids = self.voxel_grid[grid_coords[:, 0], grid_coords[:, 1], grid_coords[:, 2], 3]
+        return points, semantics_conf, class_ids
+
+    def compute_my_semantic_IG(self,seman):
+        """
+        Compute semantic information gain
+        :seman : voxel index 
+        :return: semantic_IG
+        """
+        # Utility_score: E[target_voxels]
+        valid_class_mask = (self.voxel_grid[..., 3] >=0)
+        # Set the ROI of these voxels to 1
+        self.voxel_grid[..., 0][valid_class_mask] = 1
+        # Ps is the layer at index 2 (semantic confidence score)
+        Ps = self.voxel_grid[seman[0], seman[1], seman[2], 2]
+        # Calculate I_sem(x)
+        I_sem_x = -Ps * torch.log2(Ps) - (1 - Ps) * torch.log2(1 - Ps)
+        return I_sem_x
+
+    def set_my_target_roi_region(self, target_position: torch.tensor) -> None:
+        """
+        In MyNBV, the target ROI is defined identical to  GNBV
+        :target_position: the self.fruit_position from the very beginning
+        """ 
+        print("#TODO: you might need to update the set_my_target_roi() each time when you get new fruit pose\
+                or you can define larger target bounds to offset the effect of position changes.")
+        
+        # Define regions of interest around the target
+        self.target_bounds = None
+        if target_position is None:
+            return
+        
+        # target in grid_coords
+        target_coords = torch.div(target_position - self.origin, self.voxel_size, rounding_mode="floor").to(torch.long)
+        # print("target_position::",target_position)
+        # print("self.origin::",self.origin)
+        # print("target_coords::",target_coords)
+        # print("self.roi_range::",self.roi_range)
+        x_min = torch.clamp(target_coords[0] - self.roi_range[0], 0, self.voxel_dims[0])
+        x_max = torch.clamp(target_coords[0] + self.roi_range[0], 0, self.voxel_dims[0])
+        y_min = torch.clamp(target_coords[1] - self.roi_range[1], 0, self.voxel_dims[1])
+        y_max = torch.clamp(target_coords[1] + self.roi_range[1], 0, self.voxel_dims[1])
+        z_min = torch.clamp(target_coords[2] - self.roi_range[2], 0, self.voxel_dims[2])
+        z_max = torch.clamp(target_coords[2] + self.roi_range[2], 0, self.voxel_dims[2])
+        
+        # 0:ROIs, 1:occ_prob, 2:sem_conf, 3:sem_class
+        self.voxel_grid[x_min:x_max, y_min:y_max, z_min:z_max, 0] = 1
+        
+        # roi_range in grid_coords
+        self.target_bounds = torch.tensor([x_min, y_min, z_min, x_max, y_max, z_max], device=self.device)
+        # print("self.voxel_dims [x, y, z]: ", self.voxel_dims )
+        # print("target_bounds [x_min, y_min, z_min, x_max, y_max, z_max]: ", self.target_bounds )
+        
+    def get_valid_indices(self, grid_coords: torch.tensor, dims: torch.tensor) -> torch.tensor:
+        """
+        Get the indices of the grid coordinates that are within the grid bounds
+        :param grid_coords: tensor of grid coordinates
+        :param dims: tensor of grid dimensions
+        :return: tensor of valid indices
+        """
+        valid_indices = ((grid_coords[:, 0] >= 0) & (grid_coords[:, 0] < dims[0])
+                            & (grid_coords[:, 1] >= 0)& (grid_coords[:, 1] < dims[1])
+                            & (grid_coords[:, 2] >= 0)& (grid_coords[:, 2] < dims[2]))
+        return valid_indices
+
+    def insert_depth_and_semantics_max_fusion(self,depth_img: torch.tensor,semantics: torch.tensor,optical_transform_in_world: torch.tensor) -> None:
+        """
+        Insert a point cloud into the voxel grid 
+        :param depth_image: depth image from the current viewpoint (W x H)
+        :param semantics: semantic confidences and labels from the current viewpoint (2 x W x H): [score, label] 
+        :param position: position of the current viewpoint (3,) in world frame
+        :param orientation: orientation of the current viewpoint (4,) in world frame
+        :return: None
+        """
+        # Convert depth image to point cloud (in Wf), and get its occupancy log-odds map
+        (ray_origins,ray_directions,                # not unit direction, it has length
+         occupancy_score_map) = get_frustum_points(depth_img, 
+                                                #    self.T_oc,     #Original: GNBV
+                                                   self.T_o_pc, 
+                                                   optical_transform_in_world, 
+                                                  self.min_depth, self.max_depth,
+                                                  self.width, self.height, 
+                                                  self.intrinsic, self.device)
+        rospy.loginfo(f"Geting point clouds from FOV")
+        
+        # frustum 3D space: contain points from near to far and span 128 depth interval in world_frame
+        ray_points = (ray_directions[:, :, None, :] * self.t_vals[None, :, None] + ray_origins[:, :, None, :]).view(-1, 3)
+        
+        rospy.loginfo(f"Converting point clouds from world to voxel frame, voxel size is: {round(self.voxel_size.item(),3)}meter")
+        # grid_coords: A tensor containing grid coordinates. Each row represents a 3D coords (x, y, z).
+        grid_coords = torch.div(ray_points - self.origin, self.voxel_size, rounding_mode="floor")  
+        
+        # A Boolean tensor indicating if each coordinate is within the specified bounds in (index)
+        valid_indices = self.get_valid_indices(grid_coords, self.voxel_dims)
+        rospy.loginfo(f"No. of valid coords vs total grid coords: {valid_indices.sum().item()}/{grid_coords.shape[0]}")
+        
+        #gx, gy, gz: Tensor containing all valid x- y- z- in grid_coords
+        gx, gy, gz = grid_coords[valid_indices].to(torch.long).unbind(-1)
+        
+        # Get the log odds of the occupancy 
+        # log_odds = log(p / (1 - p)): 1 is occ_prob, 2 is sem_conf  | Two layers
+        # log_odds = torch.log(torch.div(self.voxel_grid[gx, gy, gz, 1:3], 1.0 - self.voxel_grid[gx, gy, gz, 1:3]))
+        
+        # log_odds = log(p / (1 - p)): 1 is occ_prob | One layers
+        occ_log_odds = torch.log(torch.div(self.voxel_grid[gx, gy, gz, 1], 1.0 - self.voxel_grid[gx, gy, gz, 1]))
+        
+        print("--Updating the log odds of the occupancy probabilities")
+        ray_occ = self.ray_occ.clone()         # self.ray_occ shape: (W x H, num_pts_per_ray, 1)
+        
+        # repeats the mask for two of the last points along each ray
+        print("TODO: why repeats the last pt twice? why not just repeat once")
+        # ray_occ[:, -2:, :] = occupancy_score_map.permute(1, 0).repeat(1, 2).unsqueeze(-1)
+        ray_occ[:, -1:, :] = occupancy_score_map.permute(1, 0).unsqueeze(-1)
+        occ_log_odds += ray_occ.view(-1, 1)[valid_indices, -1]
+        
+        print("--Updating the log odds of the semantic probabilities")
+        ray_sem = self.ray_sem.clone()          # (W x H, num_pts_per_ray, 2); 
+        ray_sem[..., -1, :] = semantics.view(-1, 2)     # 52428800 * 2
+        ray_sem = ray_sem.view(-1, 2)
+        
+        print("Convert the log odds back to occupancy probabilities")
+        occ_odds = torch.exp(occ_log_odds)
+        # Assign occupancy_prob to voxel_grid
+        self.voxel_grid[gx, gy, gz, 1] = torch.div(occ_odds, 1.0 + occ_odds) # odds=p/(1-p) => p=odds/(1+odds)
+        
+        
+        rospy.loginfo(f"Applying Max fusion algo voxel-wise on the semantics")
+        # from paper: Efficient Search and Detection of Relevant PlantParts using Semantics-Aware Active Vision
+        
+        # Extract the current class ID and semantic confidence from the voxel grid
+        current_class_id = self.voxel_grid[gx, gy, gz, 3]
+        current_sem_conf = self.voxel_grid[gx, gy, gz, 2]
+        
+        # New class ID and semantic confidence from the current ray
+        new_class_id = ray_sem[valid_indices, 1]
+        new_sem_conf_log_odds = ray_sem[valid_indices, 0]           # conf_score log_odds
+        new_sem_conf_odds = torch.exp(new_sem_conf_log_odds)
+        new_sem_conf = torch.div(new_sem_conf_odds, 1.0 + new_sem_conf_odds)
+        
+        # Get unique values from the tensor
+        unique_values_cur = torch.unique(current_class_id)
+        unique_values_new = torch.unique(new_class_id)
+        print("unique_values_cur: ", unique_values_cur)
+        print("unique_values_new: ", unique_values_new)
+        # rospy.loginfo(f"Unique labels in current class: {unique_values_cur.item()}")
+        # rospy.loginfo(f"Unique labels in new class: {unique_values_new.tolist()}")
+        
+        # Initialize updated class ID and confidence
+        updated_class_id = current_class_id.clone()
+        updated_conf = current_sem_conf.clone()
+        
+        # Create a mask for where the class IDs are the same
+        same_id_mask = current_class_id == new_class_id
+        # Average confidence scores where the class IDs are the same
+        updated_conf[same_id_mask] = (current_sem_conf[same_id_mask] + new_sem_conf[same_id_mask]) / 2
+        
+        # Mask for when the new semantic conf is >= the current conf, across different classes
+        higher_conf_diff_class_mask = ~same_id_mask & (new_sem_conf >= current_sem_conf)
+        # Update class IDs and confidence scores where the new confidence is higher for different classes
+        updated_class_id[higher_conf_diff_class_mask] = new_class_id[higher_conf_diff_class_mask]
+        updated_conf[higher_conf_diff_class_mask] = self.voxel_max_fusion_coef* new_sem_conf[higher_conf_diff_class_mask]
+
+        # Update the voxel grid with the new class ID and semantic confidence
+        self.voxel_grid[gx, gy, gz, 3] = updated_class_id    # Update class ID
+        self.voxel_grid[gx, gy, gz, 2] = updated_conf        # Update semantic confidence
+        self.voxel_grid[..., 1:3]=torch.clamp(self.voxel_grid[..., 1:3],self.eps,1.0 - self.eps) # clamping 1:occ_prob 2:sem_conf
+        
+        print("Done with Max fusion -----------------")
+        
+        if self.evaluation_metric == 'semantic_class':
+            if self.target_bounds is not None:
+                target_voxels = self.voxel_grid[
+                    self.target_bounds[0] : self.target_bounds[3],
+                    self.target_bounds[1] : self.target_bounds[4],
+                    self.target_bounds[2] : self.target_bounds[5],
+                    3]   #0:ROIs, 1:occ_prob, 2:sem_conf, 3:sem_class
+                # Create a boolean mask where labels are not -1
+                non_background_mask =  target_voxels != -1
+                explored = non_background_mask.sum()
+                coverage = round(explored.item()/target_voxels.numel(), 6) 
+                # print("No of explored semantic voxels / total voxels:", explored.item(), " / ", target_voxels.numel())
+                rospy.loginfo(f"Using evaluation metric: {self.evaluation_metric}  No of explored semantic voxels / total voxels: {explored.item()}/{target_voxels.numel()}")
+        if self.evaluation_metric == 'coverage':
+            # Check the values within the target bounds and count the number of updated voxels
+            if self.target_bounds is not None:
+                target_voxels = self.voxel_grid[
+                    self.target_bounds[0] : self.target_bounds[3],
+                    self.target_bounds[1] : self.target_bounds[4],
+                    self.target_bounds[2] : self.target_bounds[5],
+                    2   ]   # 2 means check semantic confidence
+                coverage = torch.sum((target_voxels != 0.5)) / target_voxels.numel() * 100
+        return coverage
+    
+    def ray_casting(self, transforms, cam_pose):
+        (ray_origins,ray_directions,                # not unit direction, it has length
+         occupancy_score_map) = get_frustum_points(None, 
+                                                #    self.T_oc,   #Original: GNBV
+                                                   self.T_o_pc, 
+                                                   transforms, 
+                                                  self.min_depth, self.max_depth,
+                                                  self.width, self.height, 
+                                                  self.intrinsic, self.device)
+        rospy.loginfo(f"Geting frustum points of the viewpoint")
+        # frustum 3D space: contain points from near to far and span 128 depth interval in world_frame
+        ray_points = (ray_directions[:, :, None, :] * self.t_vals[None, :, None] + ray_origins[:, :, None, :]).view(-1, 3)
+        # grid_coords: A tensor containing grid coordinates. Each row represents a 3D coords (x, y, z).
+        grid_coords = torch.div(ray_points - self.origin, self.voxel_size, rounding_mode="floor")  
+        valid_indices = self.get_valid_indices(grid_coords, self.voxel_dims)
+        rospy.loginfo(f"No. of valid coords vs total grid coords: {valid_indices.sum().item()}/{grid_coords.shape[0]}")
+        gx, gy, gz = grid_coords[valid_indices].to(torch.long).unbind(-1)
+        
+        # Remove duplicated points: might be optional here
+        # test_combined_indices = torch.stack((gx, gy, gz), dim=-1)
+        # print("test_combined_indices are:",test_combined_indices, "size are: ",test_combined_indices.size())
+        # unique_test_combined_indices = torch.unique(test_combined_indices, dim=0)
+        # print("unique_test_combined_indices are:",unique_test_combined_indices, "size are: ",unique_test_combined_indices.size())
+        # indexes from 28366080 to 331498
+        
+        current_class_id = self.voxel_grid[gx, gy, gz, 3]
+        
+        # Create a boolean mask for where current_class_id is greater than -1
+        mask = current_class_id > -1
+        # Get indices where the current_class_id is greater than -1
+        valid_semantic_id_indices = torch.nonzero(mask, as_tuple=True)
+        # Extract the voxel grid indices where current_class_id > -1
+        filtered_gx = gx[valid_semantic_id_indices]
+        filtered_gy = gy[valid_semantic_id_indices]
+        filtered_gz = gz[valid_semantic_id_indices]
+        
+        # Optionally combine indices to get a list of tuples (if you need them in this format)
+        combined_indices = torch.stack((filtered_gx, filtered_gy, filtered_gz), dim=-1)
+        rospy.loginfo(f"Indices in voxel_grid with class_id > -1: {combined_indices.shape[0]} elements found.")
+        unique_combined_indices = torch.unique(combined_indices, dim=0)
+        rospy.loginfo(f"After removing duplicated points, {unique_combined_indices.size()[0]} unique semantic voxels left.")
+        # indexes from 11649 to 170
+        # print("<<<<unique_combined_indices are ", unique_combined_indices) 
+        rospy.loginfo(f"Computing viewpoint utility score")
+        vp_posi = transforms[0, :3, 3]
+        # print("vp_posi world frame is:", vp_posi)
+        # target in grid_coords
+        vp_posi_idx = torch.div(vp_posi - self.origin, self.voxel_size, rounding_mode="floor").to(torch.long)
+        vp_posi_idx = vp_posi_idx.cpu().numpy() 
+        print("vp_posi grid_coords is :", vp_posi_idx)
+        semantic_idx = unique_combined_indices.cpu().numpy()
+        # print("semantic_idx are:", semantic_idx)
+        visible_semantic_idx = []
+        for sem_voxel in semantic_idx:
+            # print("sem_voxel is ", sem_voxel)
+            traversed_voxels= raycast_3d(vp_posi_idx, sem_voxel)
+            # print("traversed_voxels is ", traversed_voxels)
+            if check_visibility(semantic_idx, traversed_voxels):
+                # print(">> >> append this sem_voxel")
+                visible_semantic_idx.append(sem_voxel)
+        
+        # print("visible_semantic_idx is ", visible_semantic_idx)
+        print("Number of visible_semantic_idx is ", len(visible_semantic_idx))
+        
+        # Usem = Gsem(v) * e^−d; G_sem(v): the expected semantic information gain 
+        G_sem = 0
+        for seman in visible_semantic_idx :
+            I_sem_x = self.compute_my_semantic_IG(seman)
+            G_sem +=  I_sem_x
+            # print("I_sem_x is ", I_sem_x) 
+        # print("G_sem is ", G_sem.item()) 
+        print("G_sem is ", G_sem) 
+        
+        # Convert cam_pose to a PyTorch tensor and move to the same device as vp_posi
+        cam_pose_tensor = torch.tensor(cam_pose[:3], device=vp_posi.device)
+        # Calculate the Euclidean distance
+        distance = torch.dist(vp_posi, cam_pose_tensor)
+        
+        # Compute e^(-d)
+        # mostion_cost = torch.exp(-distance)
+        mostion_cost = torch.exp(distance)
+        print("mostion_cost is ", mostion_cost.item()) 
+        return (G_sem * mostion_cost).item()
+    
+    
+    # def get_ray_sampler(self):
+    #     return self.ray_sampler
+
+    # TODO: I don't think I need this function
+    def compute_gain(
+        self,
+        camera_params: torch.tensor,
+        target_position: torch.tensor,
+    ) -> torch.tensor:
+        """
+        Compute the gain for a given set of parameters
+        :param camera_params: camera parameters
+        :param target_position: target parameters
+        :param current_params: current parameters
+        :return: total gain for the viewpoint defined by the parameters
+        """
+        quat = look_at_rotation(camera_params, target_position)
+        transforms = transform_from_rotation_translation(
+            quat[None, :], camera_params[None, :]
+        )
+        # Compute point cloud by ray-tracing along ray origins and directions
+        t_vals = self.t_vals.clone().requires_grad_()
+        ray_origins, ray_directions, _ = self.ray_sampler.ray_origins_directions(
+            transforms=transforms
+        )
+        ray_points = (
+            ray_directions[:, :, None, :] * t_vals[None, :, None]
+            + ray_origins[:, :, None, :]
+        ).view(-1, 3)
+        ray_points_nor = self.normalize_3d_coordinate(ray_points)
+        ray_points_nor = ray_points_nor.view(1, -1, 1, 1, 3).repeat(2, 1, 1, 1, 1)
+        # Sample the occupancy probabilities and semantic confidences along each ray
+        grid = self.voxel_grid[None, ..., 1:3].permute(4, 0, 1, 2, 3)
+        occ_sem_confs = F.grid_sample(grid, ray_points_nor, align_corners=True)
+        occ_sem_confs = occ_sem_confs.view(2, -1, self.num_pts_per_ray)
+        occ_sem_confs = occ_sem_confs.clamp(self.eps, 1.0 - self.eps)
+        # Compute the entropy of the semantic confidences along each ray
+        opacities = torch.sigmoid(1e7 * (occ_sem_confs[0, ...] - 0.51))
+        transmittance = self.shifted_cumprod(1.0 - opacities)
+        ray_gains = transmittance * self.entropy(occ_sem_confs[1, ...])
+        # Create a gain image for visualization
+        gain_image = ray_gains.view(-1, self.num_pts_per_ray).sum(1)
+        gain_image = gain_image.view(self.height, self.width)
+        gain_image = gain_image - gain_image.min()
+        # gain_image = gain_image / gain_image.max()
+        gain_image = gain_image / 32.0
+        gain_image = gain_image.detach().cpu().numpy()
+        gain_image = plt.cm.viridis(gain_image)[..., :3]
+        # Compute the semantic gain
+        semantic_gain = torch.log(torch.mean(ray_gains) + self.eps)
+        loss = -semantic_gain
+        return loss, gain_image
+
+    # TODO: I don't think I need this function
+    def entropy(self, probs: torch.tensor) -> torch.tensor:
+        """
+        Compute the entropy of a set of probabilities
+        :param probs: tensor of probabilities
+        :return: tensor of entropies
+        """
+        probs_inv = 1.0 - probs
+        gains = -(probs * torch.log2(probs)) - (probs_inv * torch.log2(probs_inv))
+        return gains
+
+    # TODO: this is not really needed in my case
+    def set_target_roi(self, target_position: torch.tensor) -> None:
+        """
+        In GNBV, they define target ROI as a cube arond the target point
+        :target_position: the self.target_position from the very beginning
+        """ 
+        # Define regions of interest around the target
+        self.target_bounds = None
+        if target_position is None:
+            return
+        
+        # target in grid_coords
+        target_coords = torch.div(target_position - self.origin, self.voxel_size, rounding_mode="floor").to(torch.long)
+        
+        # roi_range
+        roi_range = 10
+        x_min = torch.clamp(target_coords[0] - roi_range, 0, self.voxel_dims[0])
+        x_max = torch.clamp(target_coords[0] + roi_range, 0, self.voxel_dims[0])
+        y_min = torch.clamp(target_coords[1] - roi_range, 0, self.voxel_dims[1])
+        y_max = torch.clamp(target_coords[1] + roi_range, 0, self.voxel_dims[1])
+        z_min = torch.clamp(target_coords[2] - roi_range, 0, self.voxel_dims[2])
+        z_max = torch.clamp(target_coords[2] + roi_range, 0, self.voxel_dims[2])
+        
+        # 0:ROIs, 1:occ_prob, 2:sem_conf, sem_class
+        self.voxel_grid[x_min:x_max, y_min:y_max, z_min:z_max, 0] = 1
+        self.voxel_grid[x_min:x_max, y_min:y_max, z_min:z_max, 2] = 0.5
+        
+        # roi_range in grid_coords
+        self.target_bounds = torch.tensor([x_min, y_min, z_min, x_max, y_max, z_max], device=self.device)
+        
+        # clamping the 1:occ_prob, 2:sem_conf
+        self.voxel_grid[..., 1:3] = torch.clamp(self.voxel_grid[..., 1:3], self.eps, 1.0 - self.eps)
+
+    # TODO: I prefer to use insert_depth_and_semantics_max_fusion finally
+    def insert_depth_and_semantics(self,depth_image: torch.tensor,semantics: torch.tensor,transforms: torch.tensor) -> None:
+        """
+        Insert a point cloud into the voxel grid
+        :param depth_image: depth image from the current viewpoint (W x H)
+        :param semantics: semantic confidences and labels from the current viewpoint (2 x W x H): [score, label] 
+        :param position: position of the current viewpoint (3,) in world frame
+        :param orientation: orientation of the current viewpoint (4,) in world frame
+        :return: None
+        """
+        # Convert depth image to point cloud (in world frame), and get its occupancy(points_mask)
+        # Getting a frustum points in world_frame
+        (   ray_origins,
+            ray_directions, # not unit direction, it has length
+            occupancy_score_mask,
+        ) = self.ray_sampler.ray_origins_directions(depth_image=depth_image, transforms=transforms)
+        
+        # frustum 3D space: contain points from near to far and span 128 depth interval
+        ray_points = (ray_directions[:, :, None, :] * self.t_vals[None, :, None] + ray_origins[:, :, None, :]).view(-1, 3)
+
+        # Test case is in my_raysampler.py file
+        # # Visualize ray points in Open3D
+        # origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(ray_points.detach().cpu().numpy())
+        # o3d.visualization.draw_geometries([origin_frame, pcd])
+
+        # Convert point cloud to voxel grid coordinates: Perform element-wise division
+        # grid_coords: A tensor containing grid coordinates. Each row in this tensor represents a 3D coordinate (x, y, z).
+        grid_coords = torch.div(ray_points - self.origin, self.voxel_size, rounding_mode="floor")  # voxel_size:0.003 meter
+        
+        # A Boolean tensor indicating if each coordinate is within the specified bounds in (index)
+        valid_indices = self.get_valid_indices(grid_coords, self.voxel_dims)
+         
+        #gx, gy, gz: Tensor containing all valid x- y- z- coordinates (in grid_coords)
+        gx, gy, gz = grid_coords[valid_indices].to(torch.long).unbind(-1)
+        
+        # Get the log odds of the occupancy and semantic probabilities
+        # log_odds = log(p / (1 - p)): 1 is occ_prob, 2 is sem_conf  | Two layers
+        log_odds = torch.log(torch.div(self.voxel_grid[gx, gy, gz, 1:3], 1.0 - self.voxel_grid[gx, gy, gz, 1:3]))
+        
+        # Update the log odds of the occupancy probabilities
+        ray_occ = self.ray_occ.clone()                      # self.ray_occ shape: (W x H, num_pts_per_ray, 1)
+        # repeats the mask for two of the last points along each ray
+        # TODO: why repeats the last 2? why not just repeat 1
+        ray_occ[:, -2:, :] = occupancy_score_mask.permute(1, 0).repeat(1, 2).unsqueeze(-1)
+        log_odds[..., 0] += ray_occ.view(-1, 1)[valid_indices, -1]
+        
+        # Update the log odds of the semantic probabilities
+        ray_sem = self.ray_sem.clone()          # (W x H, num_pts_per_ray, 2); num_pts_per_ray = 128
+        ray_sem[..., -1, :] = semantics.view(-1, 2)
+        ray_sem = ray_sem.view(-1, 2)
+        log_odds[..., 1] += ray_sem[valid_indices, 0] # conf_score
+        
+        # Convert the log odds back to occupancy and semantic probabilities
+        odds = torch.exp(log_odds)
+        # assign occupancy_prob and conf_prob to voxel_grid
+        self.voxel_grid[gx, gy, gz, 1:3] = torch.div(odds, 1.0 + odds) # odds=p/(1-p) => p=odds/(1+odds)
+        
+        # clamping the 1:occ_prob, 2:sem_conf
+        self.voxel_grid[..., 1:3] = torch.clamp(self.voxel_grid[..., 1:3], self.eps, 1.0 - self.eps)
+        
+        # add class id to voxel_grid
+        self.voxel_grid[gx, gy, gz, 3] = ray_sem[valid_indices, 1] # class_id
+        
+        if self.nbv_method == 'mynbv':
+        # TODO: calculate occlusion rate here
+            metric_score =0
+            return metric_score
+        else:
+            # Check the values within the target bounds and count the number of updated voxels
+            if self.target_bounds is not None:
+                # roi_range in grid_coords
+                target_voxels = self.voxel_grid[
+                    self.target_bounds[0] : self.target_bounds[3],
+                    self.target_bounds[1] : self.target_bounds[4],
+                    self.target_bounds[2] : self.target_bounds[5],
+                    2 ]     # 2 means check semantic confidence
+                
+                # Use numel() to find the number of elements in the tensor
+                number_of_elements = target_voxels.numel() 
+                # coverage rate: actually this coverage does not make sense to pickup in my case
+                coverage = torch.sum((target_voxels != 0.5)) / number_of_elements * 100
+                return coverage
+
+    # TODO: this is not really needed in my case
+    def normalize_3d_coordinate(self, points):
+        """
+        Normalize a tensor of 3D points to the range [-1, 1] along each axis.
+        :param points: tensor of 3D points of shape (N, 3)
+        :return: tensor of normalized 3D points of shape (N, 3)
+        """
+        # Compute the range of values for each dimension
+        x_min, y_min, z_min = self.min_bound
+        x_max, y_max, z_max = self.max_bound
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        z_range = z_max - z_min
+        # Normalize the points to the range [-1, 1]
+        n_points = points.clone()
+        n_points_out = torch.zeros_like(n_points)
+        n_points_out[..., 0] = 2.0 * (n_points[..., 2] - z_min) / z_range - 1.0
+        n_points_out[..., 1] = 2.0 * (n_points[..., 1] - y_min) / y_range - 1.0
+        n_points_out[..., 2] = 2.0 * (n_points[..., 0] - x_min) / x_range - 1.0
+        return n_points_out
+
+    # TODO: I don't think I need this function
+    def shifted_cumprod(self, x: torch.tensor, shift: int = 1) -> torch.tensor:
+        """
+        Computes `torch.cumprod(x, dim=-1)` and prepends `shift` number of ones and removes
+        `shift` trailing elements to/from the last dimension of the result
+        :param x: tensor of shape (N, ..., C)
+        :param shift: number of elements to prepend/remove
+        :return: tensor of shape (N, ..., C)
+        """
+        x_cumprod = torch.cumprod(x, dim=-1)
+        x_cumprod_shift = torch.cat(
+            [torch.ones_like(x_cumprod[..., :shift]), x_cumprod[..., :-shift]], dim=-1
+        )
+        return x_cumprod_shift
+
+
+
+
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    # Create a ray sampler
+    tensor_c = torch.rand(10, 3)
+    # Define a NumPy array with a very small value
+    array_d = np.array([0.003])
+
+    # Convert NumPy array to a PyTorch tensor
+    tensor_d = torch.tensor(array_d, dtype=torch.float32)
+
+    # Perform element-wise division
+    result = torch.div(tensor_c, tensor_d, rounding_mode="floor")
+    
+    print(result)
+    voxel_dims=torch.tensor(np.array([100,250,105]), dtype=torch.float32)
+    valid_indices = get_valid_indices(result, voxel_dims)
+    print(valid_indices)
+    
+    gx, gy, gz = result[valid_indices].to(torch.long).unbind(-1)
+    print(gx, gy, gz)
+    
+    if False:
+        print("Test case 2")
+        # Assuming `voxel_grid` and `num_features` are defined as:
+        num_features = 4  # 0: ROI, 1: occ_prob, 2: sem_conf, 3: sem_class_id
+        voxel_grid = torch.zeros(4, 4, 3, num_features, dtype=torch.float32, device='cuda')  # Example device
+
+        # Set up some example values for `sem_class_id`
+        # For demonstration, randomly assign some class IDs (some within 0 to 3, some outside)
+        torch.manual_seed(0)
+        voxel_grid[..., 3] = torch.randint(0, 10, (4, 4, 3))  # random integers from 0 to 4
+
+        # Check which voxels have `sem_class_id` within the range [0, 3]
+        # valid_class_mask = (voxel_grid[..., 3] >= 0) & (voxel_grid[..., 3] <= 3)
+        valid_class_mask = (voxel_grid[..., 3] >=9)
+        
+        # Set the ROI of these voxels to 1
+        voxel_grid[..., 0][valid_class_mask] = 1
+
+        # Print to verify changes
+        print("Voxel grid updates (showing only a few slices for brevity):")
+        print("sem_class_ids:")
+        # print(voxel_grid[:, :, :, 3][0])  # Display some sem_class_id values from the first slice
+        print(voxel_grid[:, :, :, 3])  # Display some sem_class_id values from the first slice
+        print(valid_class_mask)  # Display some sem_class_id values from the first slice
+        print("ROIs set based on sem_class_ids:")
+        # print(voxel_grid[:, :, :, 0][0])  #
+        print(voxel_grid[:, :, :, 0])  #
+    
+    

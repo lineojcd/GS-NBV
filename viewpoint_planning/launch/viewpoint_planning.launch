@@ -1,0 +1,246 @@
+<launch>
+  <!-- Argument to select the planner from user input -->
+  <arg name="planner" default="gsnbv" />                       <!-- gsnbv/scnbv/test/gnbv/placeholder  -->
+
+  <!-- Argument to define the init tree position -->
+  <arg name="tree_root_pos_x" default="0.01" />
+  <arg name="tree_root_pos_y" default="-0.50" />
+  <!-- <arg name="tree_root_pos_z" default="-0.04" /> -->
+  <arg name="tree_root_pos_z" default="0.03" />
+  <!-- Argument to define the init camera to target distance -->
+  <arg name="init_cam_dist" default="0.40" />
+  <!-- Argument to define the viewpoint sampling radius -->
+  <arg name="vp_sampling_radius" value="0.21" />
+  <arg name="rear_non_workspace" value="90" />
+
+  <!-- Project Path configuration -->
+  <param name="workspace_path" value="/home/jcd/gsnbv_ws/src/" /> 
+
+
+  <!-- GSViewpointPlanning parameter -->
+  <!-- param for spawn models location in Gazebo -->
+  <param name="init_cam_dist" value="$(arg init_cam_dist)" /> 
+  
+  <arg name="init_tar_height_offset" value="0.52" />                       <!-- Init arm to tree distance -->
+  <param name="init_tar_height_offset" value="$(arg init_tar_height_offset)" />                       <!-- Init arm to tree distance -->
+  <arg name="avo_height_offset" value="0.029" />                       <!-- Init arm to tree distance -->
+  <param name="avo_height_offset" value="$(arg avo_height_offset)" />                  <!--  Half fruit height -->
+  
+  <param name="model_init_pose" value="$(eval str(arg('tree_root_pos_x')) + ' ' + str(arg('tree_root_pos_y')) + ' ' + str(arg('tree_root_pos_z')))" />         
+  <param name="init_tar_posi" value="$(eval str(arg('tree_root_pos_x')) + ' ' + str(float(arg('tree_root_pos_y'))) + ' ' + str(float(arg('tree_root_pos_z')) + float(arg('init_tar_height_offset'))))" />
+  <param name="picking_threshold" value="0.90" />
+  <!-- 0.489 = 0.46 + avo_height_offset -->
+  <!-- <param name="fruit_posi_GT" value="0.00 -0.36 0.489" />             -->
+  
+  <param name="fruit_posi_GT" value="$(eval str(arg('tree_root_pos_x')) + ' ' + str(arg('tree_root_pos_y') + 0.14) + ' ' + str(arg('tree_root_pos_z') + 0.50 + float(arg('avo_height_offset'))))" />
+  <param name="fruit_axis_GT" value="0 0 1" />                      
+  <param name="fruit_pose_update_rate" value="0.70" />              <!--  step size for fruit pose updation -->
+  <param name="source_frame" value="j2n6s300_end_effector" />
+  <param name="target_frame" value="d435_link" />
+  <param name="arm_type" value="jaco2" />                           <!--  jaco2/gnbv -->
+  <param name="max_planning_iters" value="10" />
+  <param name="init_arm_setting_time" value="5.0" />
+  <param name="arm_move_waitting_time" value="7.0" />
+  <param name="experiment_env" value="sim" />                       <!--  sim/real -->
+  <param name="verbose_planning" value="false" />
+  <param name="rot_optical_to_cam" value="0.7071 0.0 0.7071 0.0" /> <!-- Rot matrix from optical to camera mounting frame -->
+                                                                    <!-- [[0 0 1],[0 -1 0],[1 0 0]] -->
+  
+
+  <!-- MyViewpointPlanner parameter -->
+  <param name="use_max_fusion" value="true" />
+  <param name="pick_offset" value="0.15" />                         <!-- # In meters -->
+  <param name="verbose_planner" value="false" />
+  <param name="rot_optical_to_pixelcam" value="0.0 0.0 0.7071 0.7071" /> <!-- Rot matrix from optical to pixelcamera frame -->
+                                                                    <!-- [[0 -1 0],[1 0 0],[0 0 1]] -->
+
+  <!-- MyViewpointSampler parameter -->
+  <param name="vp_sampling_radius" value="$(arg vp_sampling_radius)" />    <!-- # In meters -->
+  <param name="verbose_vpsampler" value="false" />                  <!-- # In meters -->
+  <param name="num_samples" value="4" />
+  <param name="workspace_bound_left" value="$(eval 270-float(arg('rear_non_workspace'))/2)" />
+  <param name="workspace_bound_right" value="$(eval 270+float(arg('rear_non_workspace'))/2)" />
+
+  <!-- NextBestView evaluation parameter -->
+  <param name="motion_dist" value="real" />                         <!-- euclidean/real  -->
+  <param name="viewpoint_motion_cost_filter" value="0.1" />         <!-- # In meters -->
+  <param name="viewpoint_semantics_gain_filter" value="10" />      
+  <param name="move_cost_coefficient" value="-1" />   
+
+  <!-- Jaco2 Arm Control parameter -->
+  <param name="max_planning_time" value="5" />
+  <param name="setting_workspace_time" value="2.0" />
+  <param name="group_name" value="arm" />
+  <!-- <param name="arm_max_reach" value="0.66" /> -->
+  <param name="arm_max_reach" value="0.60" />                       <!-- maybe 0.58  -->
+  <param name="arm_min_reach" value="0.10" />                       <!-- maybe 0.58  -->
+  <param name="arm_origin" value="0.0 0.0 0.2755" />                
+  <param name="tree_obstacle_range" value="0.22 0.43 0.42" />       <!-- # Adjust the size as needed -->
+  
+  <!-- Octomap parameter -->
+  <param name="verbose_octomap" value="false" />
+  <!-- <param name="voxel_origin" value="0.26 -0.54 0.15" />              -->
+  <!-- voxel_origin:[0.0-vp_sampling_radius, -0.4-vp_sampling_radius, 0.15] -->
+  <!-- <param name="voxel_origin" value="-0.24 -0.64 0.15" />              -->
+  <param name="voxel_origin" value="$(eval str(0.0 - float(arg('vp_sampling_radius'))) + ' ' + str(-0.4 - float(arg('vp_sampling_radius'))) + ' ' + str(0.2 + float(arg('tree_root_pos_z'))))" />             
+
+  <param name="grid_range" value="0.42 0.45 0.84" />                <!-- Configure Octomap size in meters -->
+  <param name="voxel_size" value="0.003" />                         <!-- 3 milimeter -->
+  <!-- log_odds(0.4) = -0.4: assume it is more like to be free -->
+  <!-- <param name="init_occ_odds" value="-0.4" />                        -->
+  <param name="occupied_lodds" value="2.2" />                       <!-- log_odds(0.9): 2.2 occupied |  log_odds(0.2): -1.4 free --> 
+  <param name="free_lodds" value="-1.4" />                        
+  <param name="init_ray_occ_lodds" value="-1.4" />                        <!-- log_odds(0.5) = 0: assume it is unknown -->             
+  <param name="init_ray_sem_conf_lodds" value="0.0" />                
+  <!-- <param name="init_sem_conf_odds" value="-0.4" />                 -->
+  <param name="init_occ_prob" value="0.5" />                        
+  <param name="init_sem_cls_id" value="-1" />                
+  <param name="roi_range" value="10 10 15" />                       <!-- ROI: fruit cube region -->
+  <param name="evaluation_metric" value="semantic_class" />          <!-- semantic_class/semantic_conf/occ_prob -->
+  <param name="near_clipping_plane" value="0.03" /> 
+  <param name="far_clipping_plane" value="0.72" />                  
+  <param name="num_features_per_voxel" value="4" />                 <!-- number of features per voxel DO NOT CHANGE-->
+  <param name="num_pts_per_ray" value="128" />                      <!-- number of points sampled along each ray -->
+  <param name="voxel_occupancy_threshold" value="0.50" />
+  <param name="roi_sem_conf" value="0.50" />                        <!-- the same setting as GNBV -->
+  <param name="roi_occ_prob" value="0.50" />                        <!-- my own setting -->
+  <param name="voxel_max_fusion_coefficient" value="0.90" />
+  <param name="voxel_roi_layer" value="0" />
+  <param name="voxel_occ_prob_layer" value="1" />
+  <param name="voxel_sem_conf_layer" value="2" />
+  <param name="voxel_sem_cls_layer" value="3" />
+
+  <!-- Realsense parameter -->
+  <param name="use_sim" value="true" />
+  <param name="filter_depth" value="true" />  
+  <param name="smooth_depth" value="false" />  
+  <param name="filter_fruit_noise" value="true" />  
+  <param name="filter_noise_level" value="1.0" />                   <!-- range between [1,2] standard deviation -->
+  <param name="shift_optical_pixel" value="true" />  
+  <param name="axis_estimation_method" value="2points" />           <!-- 2points/PCA  -->
+  <param name="fruit_position_estimation_method" value="fruit_body" />           <!-- fruit_body/fruit_contour  -->
+  <param name="camera_type" value="d435" />                         <!-- d435/l515  -->
+  <param name="max_depth_value" value="1" />
+  <param name="camera_depth_unit" value="1000.0" />
+  <param name="occlusion_depth_offset" value="0.06" />
+  <param name="depth_completion" value="true" />
+  <param name="verbose_perceiver" value="false" />
+
+  <!-- Yolo parameter -->
+  <param name="show_yolo_redict" value="false" />            
+  <param name="yolo_conf_threshold" value="0.62" />  
+  <param name="PIL_RGB_format" value="RGB" />  
+  <param name="classification_background_label" value="-1" />
+  <param name="classification_background_label_confidence_logodds" value="0.0" />
+  <param name="Yolov8_weights_name" value="myvpp10_yolov8m_36p_best.pt" />  
+
+  <!-- Geometric parameter -->
+  <param name="verbose_geometric" value="false" />
+  <param name="show_contour_annotated_img" value="false" />            
+  <param name="extract_contour" value="true" />            
+  <param name="contour_extract_algo" value="morph_algo" />              <!-- morph_algo/neighbor_algo  -->
+  <param name="contour_indicator_id" value="2" />            
+  <param name="envelope_indicator_id" value="3" />   
+  <param name="fruit_peduncle_pixel_distance_threshold" value="8" />   
+
+  <!-- Visualizer parameter -->
+  <param name="verbose_rviz" value="false" />
+  <param name="voxel_frame_length" value="0.1" />
+  <param name="valid_viewpoint_color" value="1.0 1.0 0.0 1" />        <!-- yellow -->
+  <param name="valid_viewpoint_scale" value="0.001 0.002 0.0" />
+  <param name="valid_viewpoint_length_coef" value="0.02" />
+  <param name="new_viewpoint_color" value="0.0 0.0 1.0 0.8" />        <!-- blue -->      
+  <param name="new_viewpoint_scale" value="0.006 0.01 0.0" />
+  <param name="new_viewpoint_length_coef" value="0.15" />
+  <param name="previous_viewpoint_color" value="1.0 0.0 1.0 0.8" />     <!-- magenta -->
+  <param name="previous_viewpoint_scale" value="0.006 0.01 0.0" />
+  <param name="previous_viewpoint_length_coef" value="0.15" />
+  <param name="filtered_viewpoint_color" value="0.753 0.753 0.753 1.0" /> <!-- silver -->
+  <param name="reachable_viewpoint_color" value="0.0 1.0 0.0 1.0" />      <!-- lime -->
+  <param name="nbv_viewpoint_color" value="1.0 0.0 0.0 1.0" />            <!-- red -->
+  <param name="nbv_viewpoint_scale" value="0.009 0.018 0.0" />
+  <param name="nbv_viewpoint_length_coef" value="0.08" />
+  <param name="fruit_GT_color" value="1.0 0.0 0.0 1.0" />
+  <param name="fruit_EST_color" value="0.0 0.0 1.0 1.0" />
+  <param name="fruit_axis_scale" value="0.003 0.003 0.058" />
+  <param name="fruit_position_scale" value="0.01" />
+  <param name="octomap_frame_scale" value="0.01 0.02 0" />
+  <param name="background_voxel_color" value="128 128 0 255" />         <!-- Teal BGR -->
+  <param name="fruit_voxel_color" value="0 0 255 255" />                <!-- Red BGR -->
+  <param name="picking_ring_color" value="1.0 0.0 1.0 0.4" />                <!-- Red BGR -->
+  <param name="picking_ring_line_width" value="0.004" />                
+  <param name="peduncle_voxel_color" value="255 0 255 255" />          <!-- magenta BGR --> 
+
+  <!-- Model Spawner parameter -->
+  <param name="fruit_model" value="real" />                         <!-- using real avocado model or fake model -->
+  
+
+  <!-- SCViewpointPlanning parameter -->
+  <param name="SCNBV_fruit_vertics_Top" value="fruit_top" />                    <!-- fruit_top  -->
+  <param name="SCNBV_fruit_vertics_Left" value="fruit_left" />                  <!-- fruit_left  -->
+  <param name="SCNBV_fruit_vertics_Right" value="fruit_right" />                <!-- fruit_right  -->
+  <param name="SCNBV_fruit_position_estimation_method" value="fruit_body" />    <!-- fruit_body  -->
+  <param name="SCNBV_equatorial_radius" value="0.02" />                         <!-- Unit in meter  -->
+  <param name="SCNBV_picking_point_height_offset" value="0.06" />                         <!-- Unit in meter  -->
+  <param name="SCNBV_sampling_spherical_R" value="0.1" />                         <!-- Unit in meter  -->
+  <param name="SCNBV_sampling_Rmin" value="$(arg vp_sampling_radius)" />                  <!-- Unit in meter  -->
+  <!-- <param name="SCNBV_sampling_Rmax" value="$(eval float(arg('vp_sampling_radius'))+0.05)" />                       -->
+  <param name="SCNBV_sampling_Rmax" value="$(arg vp_sampling_radius)" />                      
+  <param name="SCNBV_sampling_phi" value="180" />                         
+  <param name="SCNBV_workspace_bound_left" value="$(eval 270-float(arg('rear_non_workspace'))/2)" />  <!-- SCNBV_sampling_theta -->
+  <param name="SCNBV_workspace_bound_right" value="$(eval 270+float(arg('rear_non_workspace'))/2)" /> 
+  <param name="SCNBV_search_space" value="3D" />                                <!-- 2D/3D -->   
+  <param name="SCNBV_RRT_step_size" value="0.1" />                                
+  <param name="SCNBV_RRT_max_node" value="10" />                                
+  <param name="SCNBV_viewpoint_semantics_gain_filter" value="0.0" />               <!-- # In meters -->                                
+  <param name="SCNBV_viewpoint_motion_cost_filter" value="0.1" />               <!-- # In meters -->                                
+  <param name="SCNBV_valid_viewpoint_color" value="1.0 1.0 0.0 1" />        <!-- yellow -->
+  <!-- <param name="SCNBV_valid_viewpoint_scale" value="0.003 0.006 0.0" /> -->
+  <param name="SCNBV_valid_viewpoint_scale" value="0.006 0.01 0.0" />
+  <!-- <param name="SCNBV_valid_viewpoint_length_coef" value="0.06" /> -->
+  <param name="SCNBV_valid_viewpoint_length_coef" value="0.15" />
+  <param name="SCNBV_nbv_viewpoint_length_coef" value="0.15" />
+  <param name="SCNBV_move_cost_coefficient" value="1" />
+  <param name="SCNBV_map_limits_up" value="0.5 0.5 1.07" />  
+  <param name="SCNBV_map_limits_bottom" value="-0.5 -0.5 0.23" />        
+  <param name="SCNBV_obstacle_region_up" value="0.12 -0.285 0.66" />        
+  <param name="SCNBV_obstacle_region_bottom" value="-0.10 -0.715 0.24" />  
+  <param name="SCNBV_occlusion_filter_method" value="farthest" />               <!-- farthest/nearest -->
+  <param name="SCNBV_occlusion_qucik_method" value="half_angle" />               <!-- half_angle/min_max -->
+  <param name="SCNBV_max_planning_iters" value="10" />
+  <param name="SCNBV_num_samples" value="4" />                                 <!-- 10 for test  -->
+  <param name="SCNBV_motion_plan_check" value="false" />     
+
+  <!-- GNBViewpointPlanning parameter -->
+  <param name="GNBV_num_samples" value="1" />                                 
+  <!-- <param name="GNBV_learning_rate" value="0.03" />    -->
+  <param name="GNBV_learning_rate" value="0.065" />   
+  <param name="GNBV_viewpoint_scale" value="0.006 0.01 0.0" />
+  <param name="GNBV_voxel_max_fusion_coefficient" value="1.00" />
+  <param name="GNBV_viewpoint_length_coef" value="0.15" />
+  <param name="exp_group" value="0.0 0 0.025" />
+
+        <!-- group_1 = np.array([0,0,-0.025]) -->
+        <!-- group_2 = np.array([0,0,0]) -->
+        <!-- group_3 = np.array([-0.06,0,0]) -->
+        <!-- group_4 = np.array([0.02,0,0]) -->
+
+  <!-- Conditionally include the Gazebo planner launch file -->
+  <group unless="$(eval arg('planner') == 'placeholder')">
+    <include file="$(find j2n6s300_moveit_config)/launch/j2n6s300_gazebo_myplanner.launch"/>     
+  </group>
+
+  <!-- Argument to choose the RViz config file -->
+  <arg name="rviz_config_name" default="my_moveit" />                         <!-- moveit/my_moveit -->
+
+  <!-- launch Rviz for visualization -->
+  <include file="$(find abb_l515_moveit_config)/launch/moveit_rviz.launch">
+    <arg name="rviz_config" value="$(find viewpoint_planning)/config/$(arg rviz_config_name).rviz"/>
+    <arg name="debug" value="false"/>
+  </include>
+
+  <!-- task manager -->
+  <node name="viewpoint_planning" pkg="viewpoint_planning" type="viewpoint_planning_node.py" output="screen">
+    <param name="planner" value="$(arg planner)" />
+  </node>
+</launch>

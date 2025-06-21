@@ -1,0 +1,301 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Tuple
+import rospy
+# from scene_representation.voxel_grid import VoxelGrid
+from scipy.spatial.transform import Rotation as R
+from scene_representation.my_voxel_grid import MyVoxelGrid
+from viewpoint_planners.my_viewpoint_sampler import MyViewpointSampler
+from scene_representation.conversions import T_from_rot_trans_np, T_from_rot_trans
+from utils.rviz_visualizer import RvizVisualizer
+from utils.my_rviz_visualizer import MyRvizVisualizer
+from utils.py_utils import numpy_to_pose, numpy_to_pose_array, look_at_rotation
+from utils.torch_utils import  transform_from_rotation_translation, transform_from_rot_trans, generate_pixel_coords, get_centroid, transform_points
+from viewpoint_planners.my_look_at_rotation import my_look_at_rotation
+
+class MyNBVPlanner(nn.Module):
+    """
+    Class to plan a locally optimal viewpoint using gradient-based optimization
+    """
+    def __init__(self,
+        image_size: np.array = np.array([600, 450]),
+        intrinsics: np.array = np.array([[685.5028076171875, 0.0, 485.35955810546875],
+                                         [0.0, 685.6409912109375, 270.7330627441406],
+                                         [0.0, 0.0, 1.0],],),
+        start_pose: np.array=None,
+        # TODO: Delete this target_position once finished
+        target_position: np.array = np.array([0.5, -0.4, 1.1]),   # target_params: fruit_position
+        # May not need this one
+        num_samples: int = 1,       
+    ) -> None:
+        """
+        Initialize the planner
+        :param image_size: size of the image in pixels
+        :param num_features: number of features per voxel
+        """
+        super(MyNBVPlanner, self).__init__()
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.width=image_size[0]
+        self.height=image_size[1]
+        self.pick_offset = rospy.get_param("pick_offset", "0.2")           # In meters
+        self.intrinsics =  torch.tensor(intrinsics,dtype=torch.float32,device=self.device)
+        # TODO: do not need this one in my planner
+        self.num_samples = num_samples
+        # self.target_position = torch.tensor(target_position, dtype=torch.float32,device=self.device)
+        self.use_max_fusion = rospy.get_param("use_max_fusion")
+        self.verbose_planner = rospy.get_param("verbose_planner")
+        # Transformation from optical frame to pc frame
+        self.r_o_pc = np.array([float(x) for x in rospy.get_param('rot_optical_to_pixelcam').split()])
+        self.T_o_pc = T_from_rot_trans_np(R.from_quat(self.r_o_pc).as_matrix(), np.zeros((1, 3)))
+        self.T_o_pc = torch.as_tensor(self.T_o_pc, dtype=torch.float32, device=self.device)
+        self.my_viewpoint_sampler = MyViewpointSampler()
+        self.rviz_visualizer = MyRvizVisualizer()
+        
+        # VoxelGrid initialization
+        self.voxel_grid = MyVoxelGrid(width=image_size[0],height=image_size[1],
+            intrinsic=self.intrinsics,T_o_pc=self.T_o_pc,device=self.device)
+        # self.voxel_grid = MyVoxelGrid(
+        #     width=image_size[0],
+        #     height=image_size[1],
+        #     # fx=intrinsics[0, 0],
+        #     # fy=intrinsics[1, 1],
+        #     # cx=intrinsics[0, 2],
+        #     # cy=intrinsics[1, 2],
+        #     intrinsic=self.intrinsics,
+        #     # T_oc=self.T_o_pc,     #Original: GNBV
+        #     T_o_pc=self.T_o_pc,
+        #     target_position=self.target_position,
+        #     device=self.device,        )
+
+        
+        self.my_camera_bounds = torch.tensor(
+            [   [   -1,-0.3,0.5,
+                    # 0,0,0,
+                    target_position[0] - 0.1,target_position[1] - 0.1,target_position[2] - 0.1,
+                ],
+                [   1,0.3,2,
+                    # 0,0,0,
+                    target_position[0] + 0.1,target_position[1] + 0.1,target_position[2] + 0.1,
+                ],],dtype=torch.float32,device=self.device)
+        
+        # TODO: check the visulization  
+        # The bound can be changed or removed for my planner
+        self.camera_bounds = torch.tensor(
+            [   [   start_pose[0] - 0.2,start_pose[1] - 0.1,start_pose[2] - 0.15,
+                    target_position[0] - 0.1, target_position[1] - 0.1,target_position[2] - 0.1,
+                ],
+                [   start_pose[0] + 0.2, start_pose[1] + 0.1, start_pose[2] + 0.15,
+                    target_position[0] + 0.1, target_position[1] + 0.1, target_position[2] + 0.1,
+                ],], dtype=torch.float32, device=self.device)
+        
+        # TODO: may not need this in my planner
+        self.camera_params = nn.Parameter(
+            torch.tensor(
+                [   start_pose[0], start_pose[1], start_pose[2],
+                    target_position[0], target_position[1], target_position[2],
+                ],dtype=torch.float32,device=self.device,requires_grad=True ))
+       
+    def get_staging_pose(self, fruit_position ):
+        staging_position = fruit_position + np.array([0,self.pick_offset,0])
+        # Ensure both pick_posi and top_wf are 1D arrays
+        staging_position = staging_position.squeeze()
+        fruit_position = fruit_position.squeeze()
+        # staging_orientation = look_at_rotation(staging_position.squeeze(), fruit_position.squeeze()) 
+        staging_orientation = my_look_at_rotation(staging_position.squeeze(), fruit_position.squeeze()) 
+        staging_pose = np.concatenate((staging_position, staging_orientation))
+        return staging_pose
+       
+    def get_viewpoint_candidates(self,fruit_position,fruit_axis, obstacle_points):
+        vp_candidates_list, valid_pose_list = self.my_viewpoint_sampler.my_nbv_sampler(fruit_position,fruit_axis, obstacle_points)
+        print("vp_candidates_list is ", vp_candidates_list)
+        print("Visualizing view_samples list")
+        self.rviz_visualizer.visualize_valid_view_samples(numpy_to_pose_array(valid_pose_list))
+        self.rviz_visualizer.visualize_selected_view_samples(numpy_to_pose_array(vp_candidates_list))
+        
+        # Draw the ground truth circle
+        # fruit_axis_GT = np.array([0, 0, 1])
+        # self.rviz_visualizer.visualize_circle(fruit_position.numpy().flatten(),fruit_axis_GT)
+        # self.rviz_visualizer.visualize_circle(fruit_position.flatten(),fruit_axis_GT)
+        return vp_candidates_list
+
+    def update_semantic_octomap(self, depth_image: np.array, semantics: torch.tensor, viewpoint: np.array) -> None:
+        """
+        Process depth and semantic images and insert them into the voxel grid
+        :param depth_image: depth image (H x W)
+        :param semantics: semantic confidence scores and class ids (H x W x 2)
+        :param viewpoint: camera position (xyz) and orientation (wxyz) w.r.t the 'world_frame'
+        """
+        depth_image = torch.tensor(depth_image, dtype=torch.float32, device=self.device)
+        position = torch.tensor(viewpoint[:3], dtype=torch.float32, device=self.device)
+        # orientation = torch.tensor(viewpoint[3:], dtype=torch.float32, device=self.device)
+        orientation = torch.tensor(R.from_quat(viewpoint[3:]).as_matrix(), dtype=torch.float32, device=self.device)
+        # get camera pose in 4*4 matrice
+        # cam_transform_in_world = transform_from_rotation_translation(orientation[None, :], position[None, :])
+        optical_transform_in_world = transform_from_rot_trans(orientation[None, :], position[None, :])
+        
+        if self.use_max_fusion:
+            metric_score = self.voxel_grid.insert_depth_and_semantics_max_fusion(depth_image, semantics, optical_transform_in_world)
+        else:
+            metric_score = self.voxel_grid.insert_depth_and_semantics(depth_image, semantics, optical_transform_in_world)
+        
+        if metric_score is not None:
+            # metric_score = metric_score.cpu().numpy()
+            metric_score = metric_score
+        return metric_score
+
+    def my_next_best_view(self, fruit_position, fruit_axis, obstacle_points, cam_pose=None) -> np.array:
+        """
+        Compute the next best viewpoint
+        :return: camera position (xyz) and orientation (wxyz) w.r.t the 'world_frame'
+        """
+        rospy.loginfo(f"Sampling valid viewpoint candidates based on fruit position, axis and radius ...")
+        vp_candidates_list = self.get_viewpoint_candidates(fruit_position,fruit_axis, obstacle_points)
+        
+        rospy.loginfo(f"Evaluating the selected viewpoint candidates ... ")
+        print("Raycasting for each VP now")
+        vp_score_list = []
+        for vp in vp_candidates_list:       # vp is an np array
+            # Calculate Utility by Paper
+            # Efficient Search and Detection of Relevant Plant Parts using Semantics-Aware Active Vision
+                
+            posi = torch.tensor(vp[:3], dtype=torch.float32, device=self.device)
+            print("Evaluating VP position: ", posi)
+            # print(">>>>>>>>>>vp_transform_in_world is ", vp_transform_in_world)
+            # orien = torch.tensor(vp[3:], dtype=torch.float32, device=self.device)
+            orien = torch.tensor(R.from_quat(vp[3:]).as_matrix(), dtype=torch.float32, device=self.device)
+            # vp_transform_in_world = transform_from_rotation_translation(orien[None, :], posi[None, :]) # get viewpose in 4*4 matrice
+            vp_transform_in_world = transform_from_rot_trans(orien[None, :], posi[None, :]) # get viewpose in 4*4 matrice
+            IG = self.voxel_grid.ray_casting(vp_transform_in_world, cam_pose)
+            print("IG is :", IG)
+            vp_score_list.append((IG, vp))
+        
+        # TODO: Build a search graph to contain the cam_poses and update it each time
+        
+        
+        # print("Show vp scores:" , vp_score_list )
+        # Convert the score from tensor to float and sort the list by the score
+        # sorted_data = sorted(vp_score_list, key=lambda x: x[0], reverse=True)
+        sorted_data = sorted(vp_score_list, key=lambda x: x[0])
+
+        for score, pose in sorted_data:
+            print(f"Score: {round(score, 2)}, Pose: {pose}")
+        nbv = sorted_data[0][1]
+        nbv = vp_score_list[-1][1]
+        self.rviz_visualizer.visualize_viewpoint(numpy_to_pose(nbv))
+        print("Visualizing the NBV now...")
+        return nbv
+    
+    
+    
+    def get_viewpoint(self) -> np.array:
+        """
+        Get the current viewpoint
+        :return: camera position (xyz) and orientation (wxyz) w.r.t the 'world_frame'
+        """
+        # Calculate the rotation quaternion to make the camera look at the target
+        # The form is a Quaternion
+        quat = look_at_rotation(self.camera_params[:3], self.camera_params[3:])
+        quat = quat.detach().cpu().numpy()
+        viewpoint = np.zeros(7)
+        viewpoint[:3] = self.camera_params.detach().cpu().numpy()[:3]
+        viewpoint[3:] = quat
+        return viewpoint
+
+
+    def my_visualize(self, fruit_position, fruit_axis):
+        """
+        Visualize the voxel grid, the target and the camera bounds in rviz
+        """
+        self.rviz_visualizer.visualize_fruit_pose_GT()
+        self.rviz_visualizer.visualize_fruit_pose_EST(fruit_position, fruit_axis)
+        self.rviz_visualizer.visualize_picking_ring_GT()
+        # get occupied voxels
+        voxel_points, _, sem_class_ids = (self.voxel_grid.get_occupied_points())
+        rospy.loginfo(f"Visualizeing {voxel_points.shape[0]} occupied voxels ...")
+        if self.verbose_planner:
+            print("voxel_points are:",voxel_points )
+        self.rviz_visualizer.visualize_voxels(voxel_points.cpu().numpy(), sem_class_ids.cpu().numpy())
+        
+    def visualize(self):
+        """
+        Visualize the voxel grid, the target and the camera bounds in rviz
+        """
+        if False:
+            voxel_points, sem_conf_prob, sem_class_ids = self.get_occupied_points()
+            self.rviz_visualizer.visualize_voxels(voxel_points, sem_conf_prob, sem_class_ids)
+            
+            # Visualize target
+            # target = self.target_position.detach().cpu().numpy()
+            target = self.camera_params.detach().cpu().numpy()[3:]
+            rois = np.array([[*target, 1.0, 0.0, 0.0, 0.0]])
+
+            # Visualize ROIS
+            self.rviz_visualizer.visualize_rois(numpy_to_pose_array(rois))
+        
+        # Visualize camera bounds
+        # camera_bounds = self.camera_bounds.cpu().numpy()[:, :3]
+        # camera_bounds = self.my_camera_bounds.cpu().numpy()[:, :3]
+        # print("visualize my_camera_bounds" )
+        # self.rviz_visualizer.visualize_camera_bounds(camera_bounds)
+        
+        
+        # -----------------Extra adding for visualization
+        # Line 194: visualize_point_cloud(self, points: np.array, color: np.array)
+        # Line 231: visualize_gt_point_cloud(self, points: np.array, color: np.array)
+        # self.rviz_visualizer.visualize_camera_bounds(camera_bounds)
+
+    # TODO: need to write this one
+    def depth_first_search_graph():
+        pass
+    
+    # TODO: need to write this one
+    def update_info():
+        pass
+
+    # TODO: may not need this in my planner
+    def next_best_view(self, target_pos=None) -> Tuple[np.array, float, int]:
+        """
+        Compute the next best viewpoint
+        :return: camera position (xyz) and orientation (wxyz) w.r.t the 'world_frame'
+        :return: loss
+        :return: number of samples
+        """
+        for _ in range(self.num_samples):
+            # First: optimization
+            self.optimizer.zero_grad()
+            loss, gain_image = self.loss(target_pos)
+            loss.backward()
+            self.optimizer.step()
+            
+            # TODO: another drawback of GNBV, they predine the camera bound
+            # Second: camera pose clamping: inside of the camera bound range
+            self.camera_params.data = torch.clamp(
+                self.camera_params.data, self.camera_bounds[0], self.camera_bounds[1]
+            )
+        
+        # Rviz visualize: viewpoint
+        viewpoint = self.get_viewpoint()
+        print("viewpoint is:",viewpoint)
+        self.rviz_visualizer.visualize_viewpoint(numpy_to_pose(viewpoint))
+        
+        # Show gain_image from a topic in a panel of Rviz
+        # self.rviz_visualizer.visualize_gain_image(gain_image)
+        
+        loss = loss.detach().cpu().numpy()
+        return viewpoint, loss, self.num_samples
+
+    
+
+
+
+
+
+
+if __name__ == '__main__':
+    viewpoint = np.array([0.5, -0.05, 1.18, 0.70711, 0 ,0, -0.70711])
+    print("viewpoint is :", viewpoint)
+    position = torch.tensor(viewpoint[:3], dtype=torch.float32)
+    orientation = torch.tensor(viewpoint[3:], dtype=torch.float32)
+    cam_transform_in_world = transform_from_rotation_translation(orientation[None, :], position[None, :])
+    print("cam_transform_in_world is :\n", cam_transform_in_world)

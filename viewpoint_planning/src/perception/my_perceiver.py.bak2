@@ -1,0 +1,497 @@
+import sys
+# sys.path.append('~/gradient_nbv_ws/src/gradientnbv/src/viewpoint_planning/src/perception/ultralytics_yolov8/')
+# print(sys.path)
+
+from ultralytics import YOLO
+import rospy
+import cv2
+import torch
+import numpy as np
+import ros_numpy
+import time
+import os
+import math
+from sensor_msgs.msg import Image
+from scene_representation.conversions import T_from_rot_trans_np
+from perception.my_geometry_info import GeometryInfo
+from perception.my_bounded_axis_test import get_bounded_fruit_axis
+from perception.my_realsense_ros_capturer import MyRealsenseROSCapturer
+from cv_bridge import CvBridge, CvBridgeError
+from utils.torch_utils import transform_from_rotation_translation, transform_from_rot_trans, generate_pixel_coords, get_centroid, transform_points, transform_points_cam_to_world_gnbv, transform_points_cam_to_world_my
+from scipy.spatial.transform import Rotation as R
+from viewpoint_planners.fit_3dline import fit_3dline_by_PCA, fit_3dline_by_2points
+from scipy.ndimage import gaussian_filter
+import matplotlib.pyplot as plt
+
+class MyPerceiver:
+    """
+    Gets data from the camera and performs semantic segmentation and pose estimation.
+    """
+
+    def __init__(self):
+        # self.toy_example=True
+        self.toy_example=False
+        self.design_pattern = True
+        
+        # TODO: change this camera to D435i
+        self.capturer = MyRealsenseROSCapturer()
+        
+        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device =  "cpu"
+        self.arm_type = 'gnbv'
+        self.arm_type = rospy.get_param('arm_type')
+        self.bridge = CvBridge()
+        # self.max_depth_value = 1
+        self.max_depth_value = rospy.get_param("max_depth_value", "1")   #Here 1 is a integer
+        # self.filter_depth = True
+        self.filter_depth = rospy.get_param("filter_depth")
+        self.smooth_depth = rospy.get_param("smooth_depth")
+        self.filter_fruit_noise = rospy.get_param("filter_fruit_noise")
+        self.filter_noise_level = rospy.get_param("filter_noise_level", "1")
+        
+        self.occlusion_depth_offset = rospy.get_param("occlusion_depth_offset", "0.04")
+        self.geo_info = GeometryInfo()
+        # self.shift_pixel = True
+        self.shift_pixel = rospy.get_param("shift_optical_pixel")
+        # self.axis_estimation = "2points"
+        self.axis_estimation = rospy.get_param("axis_estimation_method")
+        self.fruit_position_estimation = rospy.get_param("fruit_position_estimation_method")
+        self.verbose_perceiver = rospy.get_param("verbose_perceiver")
+        # Transformation from optical frame to camera frame
+        r = R.from_euler("xyz", [-np.pi / 2, 0.0, -np.pi / 2])
+        self.T_oc_gnbv = T_from_rot_trans_np(r.as_matrix(), np.zeros((1, 3)))
+        r_my = R.from_quat([0.5, -0.5, 0.5, 0.5])
+        self.T_oc_my = T_from_rot_trans_np(r_my.as_matrix(), np.zeros((1, 3)))
+        # [[ 0. -1.  0.  0.]
+        # [ 0.  0. -1.  0.]
+        # [ 1.  0.  0.  0.]
+        # [ 0.  0.  0.  1.]]
+        # self.T_oc = torch.as_tensor(self.T_oc, dtype=torch.float32, device=self.device)
+        
+        # self.free_prob = 0.4            #log_odds(0.4) = -0.4
+        # self.occ_prob =  0.9            #log_odds(0.9) = 2.2
+        self.free_odds = -1.4           #log_odds(0.2) = -1.4  | 5 class: each class 20%
+        
+        #TODO: May not need. Delete this function once project is done
+        # current_directory = os.getcwd()
+        # print(f"Current working directory: {current_directory}")  #/home/jcd/.ros
+        # res = os.path.join(APPEND_PATH,"weights/myvpp_sim_best.pt")
+        # model_path = "/home/jcd/gradient_nbv_ws/src/gradientnbv/src/viewpoint_planning/src/perception/ultralytics_yolov8/weights/myvpp_sim_best.pt"
+        # self.model =  YOLO(model_path)
+
+    def log_odds(self, p):
+        # log_odds(0.4)  : -0.4  log_odds(0.9)  : 2.2
+        return np.log(p / (1 - p))
+
+    def get_camera_info(self):
+        camera_info, _, _ = self.capturer.get_frames()
+        self.width = camera_info.width
+        self.height = camera_info.height
+        self.intrinsics = torch.tensor(np.array(camera_info.K).reshape(3, 3),dtype=torch.float32,device=torch.device("cuda:0"))
+        return camera_info
+
+    def filter_depth_image(self, depth_image):
+        # Realsense L515: Use np.where to replace NaN values
+        # return np.where(np.isnan(depth_image), self.max_depth_value, depth_image)
+        
+        # Realsense D435: Replace 9999 with max_depth_value
+        return np.where(depth_image > self.max_depth_value, self.max_depth_value, depth_image)
+        # return np.where((depth_image > self.max_depth_value) | (depth_image == 0), 
+        #                self.max_depth_value, depth_image)
+
+    
+    def publish_annotated_img(self,annotated_image):
+        try:
+            # Convert the processed CV2 image back to ROS Image message
+            ros_image = self.bridge.cv2_to_imgmsg(annotated_image, "bgr8")  
+            self.capturer.image_pub.publish(ros_image)
+        except CvBridgeError as e:
+            rospy.logerr("CvBridge Error: {0}".format(e))
+
+    def get_sensor_data(self):
+        camera_info, color_output, depth_output = self.capturer.get_frames()
+        color_image = color_output["color_image"]
+        depth_image = depth_output["depth_image"]  # np.array
+        points = depth_output["points"]
+        
+        # Return if no data
+        if camera_info is None or color_image is None:
+            rospy.logwarn("[Perceiver] Perception paused. No data from camera.")
+            return None, None, None, None
+        return camera_info, color_image, depth_image, points
+
+    def run(self):
+        # Get data from camera
+        camera_info, color_image, depth_image, points = self.get_sensor_data()  # # np.array
+        
+        if camera_info is None or color_image is None or depth_image is None:
+            return None, None, None, None, None
+        
+        # print("depth_image shape", depth_image.shape)
+        # print("depth_image is", depth_image)
+        
+        print("depth_image before filter stats:")
+        print(f"Mean: {np.mean(depth_image)}, Min: {np.min(depth_image)}, Max: {np.max(depth_image)}, Std: {np.std(depth_image)} ")
+            
+        
+        if self.filter_depth:
+            filtered_depth_image = self.filter_depth_image(depth_image)    # Use np.where to replace NaN values by max_depth_value
+            # print("depth_image after filter stats:")
+            # print(f"Mean: {np.mean(depth_image)}, Min: {np.min(depth_image)}, Max: {np.max(depth_image)}, Std: {np.std(depth_image)} ")
+            
+            print("depth_image after filter stats:")
+            print(f"Mean: {np.mean(filtered_depth_image)}, Min: {np.min(filtered_depth_image)}, Max: {np.max(filtered_depth_image)}, Std: {np.std(filtered_depth_image)} ")
+        
+            # Calculate mean, min, max, and standard deviation
+            # mean_value = np.mean(depth_image)
+            # min_value = np.min(depth_image)
+            # max_value = np.max(depth_image)
+            # std_value = np.std(depth_image)
+            
+        if self.smooth_depth:
+            smoothed_depth_map = gaussian_filter(filtered_depth_image, sigma=1)
+        
+        show = False
+        if show:
+            # Create a figure with two subplots
+            plt.figure(figsize=(18, 6))
+            
+            # Plot the original depth map
+            plt.subplot(1, 3, 1)
+            # plt.imshow(depth_image, cmap='jet', vmin=0, vmax=1)
+            plt.imshow(depth_image, cmap='jet')
+            plt.colorbar(label='Depth Value')
+            plt.title('Original Depth Map')
+
+            # Plot the noisy depth map
+            plt.subplot(1, 3, 2)
+            # plt.imshow(filtered_depth_image, cmap='jet', vmin=0, vmax=1)
+            plt.imshow(filtered_depth_image, cmap='jet')
+            plt.colorbar(label='Depth Value')
+            plt.title('Filtered_depth_image')
+
+            # Plot the smoothed depth map
+            plt.subplot(1, 3, 3)
+            # plt.imshow(smoothed_depth_map, cmap='jet', vmin=0, vmax=1)
+            plt.imshow(smoothed_depth_map, cmap='jet')
+            plt.colorbar(label='Depth Value')
+            plt.title('Smoothed Depth Map')
+
+            # Show the plots side by side
+            plt.show()
+        
+        # Yolo segmentation
+        annotated_image, seg_masks, semantic_res_dict,picking_condi = self.geo_info.model_predict_ros(color_image)
+        self.publish_annotated_img(annotated_image)
+        
+        keypoint_dict = self.geo_info.get_fruit_keypoints()
+        start_time = time.time()
+        occlusion_rate, occluded_pts = self.get_occlusion_rate(filtered_depth_image, seg_masks)
+        print(f"valid occlusion_rate is: {occlusion_rate},  compute occlusion rate takes: {time.time() - start_time} seconds")
+        picking_score = picking_condi * (1 - occlusion_rate)
+        # check pickable condition: 
+        # a) picking_condi_score: entire visiable fruit & peduncle 
+        # b) metric_score: no sorrounding occluded pixels
+        print("Picking score in current view is picking_condi * (1 - occlusion_rate): ",picking_score)
+        
+        
+        keypoint_dict = {**keypoint_dict, **occluded_pts}
+        print("keypoint_dict is : hide here" )
+        
+        # Maximum value: 1  Minimum value: 0
+        
+        start_time = time.time()
+        semantics = self.assign_semantics_network(camera_info, seg_masks,semantic_res_dict)  
+        print(f"Assign semantics for network detector takes: {time.time() - start_time} seconds")
+        
+            
+        return filtered_depth_image,  keypoint_dict,semantics, picking_score
+
+    def get_occlusion_rate(self,depth_image, seg_masks):
+        layer = seg_masks.shape[0]
+        if layer <3:
+            return -1
+        
+        contour_mask = seg_masks[-2]
+        envelope_mask = seg_masks[-1] 
+        contour_idx = contour_mask.nonzero(as_tuple=False)
+        envelope_idx = envelope_mask.nonzero(as_tuple=False)
+        contour_depth_v = depth_image[contour_idx[:, 0], contour_idx[:, 1]]
+        envelope_depth_v = depth_image[envelope_idx[:, 0], envelope_idx[:, 1]]
+        
+        # print("contour_depth_v.flatten():", contour_depth_v.flatten())
+        # print("envelope_depth_v.flatten():", envelope_depth_v.flatten())
+        
+        # Apply a mask to filter out 0 and 1 values
+        valid_contour_depth_mask = (contour_depth_v != 0) & (contour_depth_v != 1)
+        valid_envelope_depth_mask = (envelope_depth_v != 0) 
+        
+        # Get the indices and values where the depth values are valid
+        valid_contour_idx = contour_idx[valid_contour_depth_mask]
+        valid_contour_depth_v = contour_depth_v[valid_contour_depth_mask]
+
+        valid_envelope_idx = envelope_idx[valid_envelope_depth_mask]
+        valid_envelope_depth_v = envelope_depth_v[valid_envelope_depth_mask]
+        
+        # print("valid_contour_depth_v.flatten():", valid_contour_depth_v.flatten())
+        # print("valid_envelope_depth_v.flatten():", valid_envelope_depth_v.flatten())
+        
+        contour_depth_v_set = set(contour_depth_v.flatten())
+        envelope_depth_v_set = set(envelope_depth_v.flatten())
+        fruit_min_depth, fruit_max_depth, enve_min_depth, enve_max_depth = self.get_contour_envelope_min_max_depth(contour_depth_v_set,envelope_depth_v_set)
+        
+        if self.verbose_perceiver:
+            print("before filter")
+            print("fruit contour min and max depth are:",fruit_min_depth ," and ", fruit_max_depth)
+            print("fruit envelope min and max depth are:",enve_min_depth ," and ", enve_max_depth)
+            print(f"Total points for contour and envelope are: {contour_depth_v.size}  and {envelope_depth_v.size}")
+        
+        contour_depth_v_set = set(valid_contour_depth_v.flatten())
+        envelope_depth_v_set = set(valid_envelope_depth_v.flatten())
+        fruit_min_depth, fruit_max_depth, enve_min_depth, enve_max_depth = self.get_contour_envelope_min_max_depth(contour_depth_v_set,envelope_depth_v_set)
+        print("After filter: fruit contour min & max depth are:",fruit_min_depth ," and ", fruit_max_depth)
+        print("After filter: fruit envelope min & max depth are:",enve_min_depth ," and ", enve_max_depth)
+        print(f"Total points for contour & envelope are: {valid_contour_depth_v.size}  and {valid_envelope_depth_v.size}")
+        
+        # print("envelope_depth_v is : ", envelope_depth_v)
+        
+        # List to store pixel indexes where the condition is met
+        occluded_pts_indexes = []
+    
+        free_pt_cnt = 0
+        # for env_pt in envelope_depth_v:
+        for i, env_pt in enumerate(valid_envelope_depth_v):
+            if env_pt.item() > fruit_max_depth + self.occlusion_depth_offset:
+                # print("curr envelope depth value is", env_pt.item())
+                free_pt_cnt += 1
+                # Store the index
+            if env_pt.item() < fruit_min_depth:
+                occluded_pts_indexes.append(valid_envelope_idx[i].tolist())
+                # print("envelope_idx[i].tolist()", envelope_idx[i].tolist())
+        
+        # Initialize variables to track leftmost and rightmost points
+        leftmost_index = None
+        rightmost_index = None
+        
+        if occluded_pts_indexes:
+            # Sort the points based on the x-coordinate (column index)
+            occluded_pts_indexes.sort(key=lambda idx: idx[1])
+
+            # Extract the leftmost and rightmost points
+            leftmost_index = occluded_pts_indexes[0]
+            rightmost_index = occluded_pts_indexes[-1]
+       
+            # Store leftmost and rightmost points in a dictionary
+            occluded_pts = {'obstacle_points_left': leftmost_index,
+                            'obstacle_points_right': rightmost_index}
+        
+        # print("leftmost_index is :", leftmost_index) 
+        # print("rightmost_index is :", rightmost_index) 
+        print("occluded_pts are: ", occluded_pts)
+        res = 1 - free_pt_cnt/valid_envelope_depth_v.size
+        return round(res,4), occluded_pts
+
+    def get_contour_envelope_min_max_depth(self, contour_depth_v_set, envelope_depth_v_set):
+        if self.filter_depth:
+            # Remove the element with max_depth_value using discard()
+            contour_depth_v_set.discard(self.max_depth_value)
+            fruit_min_depth = round(min(contour_depth_v_set),4)
+            fruit_max_depth = round(max(contour_depth_v_set),4)
+            enve_min_depth = round(min(envelope_depth_v_set),4)
+            enve_max_depth = round(max(envelope_depth_v_set),4)
+        else:
+            # Remove NaN values using set comprehension and math.isnan
+            contour_depth_v_set_filtered = {x for x in contour_depth_v_set if not math.isnan(x)}
+            envelope_depth_v_set_filtered = {x for x in envelope_depth_v_set if not math.isnan(x)}
+            fruit_min_depth = round(min(contour_depth_v_set_filtered),4)
+            fruit_max_depth = round(max(contour_depth_v_set_filtered),4)
+            enve_min_depth = round(min(envelope_depth_v_set_filtered),4)
+            enve_max_depth = round(max(envelope_depth_v_set_filtered),4)
+        return fruit_min_depth, fruit_max_depth, enve_min_depth, enve_max_depth
+
+    def assign_semantics_network(self, camera_info, seg_masks,semantic_res_dict) -> torch.tensor:
+        """
+        Assign the confidence scores and labels to the pixels in the image
+        :param camera_info: camera information: height and width
+        :param seg_masks: segmentation mask [H x W]   / [No x H x W]
+        :param semantic_res: list[(class_id, class_conf)] 
+        :return: semantic confidence scores and labels [H x W x 2]
+        """
+        # Create a mask that is log odds 0.9 if there's a semantic value and log odds of 0.4 (free) otherwise
+        
+        # a default value of ci = −1 and Po(i) = 0.5 were assigned
+        image_size = (camera_info.height, camera_info.width)
+        # Initialize all the label as background
+        label_mask = -1 * torch.ones(image_size, dtype=torch.float32, device=self.device)
+        # Initialize all the conf score mask as free
+        conf_score_odds_mask = self.free_odds * torch.ones(image_size, dtype=torch.float32, device=self.device)
+        
+        if len(semantic_res_dict) ==0:
+            print("No OOI detected in current view, only backgrounds")
+            return None
+        else:
+            semantic_res = list(semantic_res_dict.items())
+            # Assign the semantic class_conf and class_id
+            # 0:fruit; 1:peduncle; -1:background; 2:contour; 3: envelope
+            for obj in range(len(semantic_res)):
+                # Extract the class_id and the log odds of the class_conf
+                class_id = semantic_res[obj][0]
+                print("cls id is :", class_id)
+                class_conf_odds = self.log_odds(semantic_res[obj][1])
+                
+                # Create a mask for the current object where the segmntation mask is greater than 0
+                current_mask = seg_masks[obj] > 0
+                
+                # Max fusion: Assign overlapping pixels to the object with higher conf
+                # Check where the new confidence is greater than what's already in the conf_score_odds_mask
+                update_mask = (current_mask & (class_conf_odds >= conf_score_odds_mask))
+                # At the same spot (env, 0.96) , (peduncle, 0.71), but you need to use peduncle instead of env
+                print("TODO: May need to handle the envelope and peduncle issue later")
+                
+                # label_mask[update_mask] = class_id
+                label_mask[update_mask] = torch.tensor(class_id, device=conf_score_odds_mask.device)
+                conf_score_odds_mask[update_mask] = class_conf_odds
+            semantics = torch.stack((conf_score_odds_mask, label_mask), dim=-1)
+            return semantics
+
+    def estimate_fruit_position(self, pixel_coords, cam_transform_in_world,  depth_img, dict_value, batch_size, verbose=False):
+        # Separate the indices into row and column indices
+        rows = dict_value[:, 0]
+        cols = dict_value[:, 1]
+        
+        # Use the indices to extract elements from pixel_coords
+        fruit_pixel_coords = pixel_coords[rows, cols].view(-1, 3) @ torch.inverse(self.intrinsics).t().type(torch.float32)
+        fruit_depth = depth_img[rows, cols].view(1, -1)
+        
+        nb_fruit_depth_pts = fruit_depth.numel()
+        
+        # Filter the fruit_depth
+        if torch.any((fruit_depth == self.max_depth_value) | (fruit_depth == 0)):
+            rospy.loginfo("Filtering invlid fruit depth value (0 or max depth value)... ")
+            # Create a boolean mask to filter out the values equal to self.max_depth_value (3)
+            depth_filter_mask = (fruit_depth != self.max_depth_value) & (fruit_depth != 0)
+            fruit_depth = fruit_depth[depth_filter_mask]
+            nb_filtered_depth_pts = nb_fruit_depth_pts - fruit_depth.numel()
+            print("Total pts:",nb_fruit_depth_pts, "filtered pts:", nb_filtered_depth_pts, "remaining pts:", fruit_depth.numel())
+            fruit_pixel_coords = fruit_pixel_coords[depth_filter_mask.flatten()]
+        
+        fruit_cam_coords = (fruit_pixel_coords * fruit_depth.unsqueeze(-1)).view(batch_size, -1, 3)
+        if verbose:
+            print("fruit_cam_coords:\n",fruit_cam_coords)
+        fruit_world_coords = transform_points_cam_to_world_my(fruit_cam_coords, cam_transform_in_world, self.arm_type).cpu()
+        return fruit_world_coords
+            
+    def estimate_fruit_pose(self,depth_img, keypt_dict, cam_pose, device = torch.device("cuda:0")):
+        """
+        Get final staging point of a fruit
+        :return: pick_pose
+        """
+        position = torch.tensor(cam_pose[:3], dtype=torch.float32, device=device)
+        # orientation = torch.tensor(cam_pose[3:], dtype=torch.float32, device=device)
+        # # get camera pose in 4*4 matrice
+        # cam_transform_in_world = transform_from_rotation_translation(orientation[None, :], position[None, :])
+        
+        orientation = torch.tensor(R.from_quat(cam_pose[3:]).as_matrix(), dtype=torch.float32, device=device)
+        # print("orientation is \n",orientation)
+        cam_transform_in_world = transform_from_rot_trans(orientation[None, :], position[None, :])
+        # print("My method: cam_transform_in_world is \n",cam_transform_in_world)
+        depth_img = torch.tensor(depth_img, dtype=torch.float32, device=device)
+        
+        batch_size = 1
+        pixel_coords = generate_pixel_coords(self.width, self.height, device, self.shift_pixel)  # ([w640, h640, 3])
+        
+        fruit_idx = keypt_dict[self.fruit_position_estimation]   # fruit_body or fruit_contour
+        fruit_world_coords = self.estimate_fruit_position(pixel_coords, cam_transform_in_world, depth_img, fruit_idx, batch_size)
+        fruit_position = get_centroid(fruit_world_coords, self.filter_fruit_noise, self.filter_noise_level).numpy()
+        
+        # Get bounded fruit axis  
+        bounded_axis = self.estimate_fruit_axis(fruit_world_coords)
+        return fruit_position, bounded_axis
+    
+    def estimate_fruit_axis(self, fruit_points_in_wf):
+        # Extract the points
+        points = fruit_points_in_wf[0]  # Remove the batch dimension
+        # Extract z-values (the third column)
+        z_values = points[:, 2]
+        # Find the index of the highest z-value
+        max_z_index = torch.argmax(z_values).item()
+        # Find the index of the lowest z-value
+        min_z_index = torch.argmin(z_values).item()
+        # Get the points with the highest and lowest z-values
+        top_pt = points[max_z_index]
+        bottom_pt = points[min_z_index]
+        
+        print("top_pt and bottom_pt are :", top_pt, bottom_pt)
+        if self.axis_estimation == "PCA":
+            axis = fit_3dline_by_PCA(fruit_points_in_wf)
+        if self.axis_estimation == "2points":
+            axis = fit_3dline_by_2points(top_pt, bottom_pt)
+        bounded_axis = get_bounded_fruit_axis(axis, plot = False)
+        return bounded_axis
+    
+    def estimate_obstacle_points(self,depth_img, keypt_dict, cam_pose, device = torch.device("cuda:0")):
+        """
+        Get final staging point of a fruit
+        :return: pick_pose
+        """
+        position = torch.tensor(cam_pose[:3], dtype=torch.float32, device=device)
+        # orientation = torch.tensor(cam_pose[3:], dtype=torch.float32, device=device)
+        orientation = torch.tensor(R.from_quat(cam_pose[3:]).as_matrix(), dtype=torch.float32, device=device)
+        
+        # get camera pose in 4*4 matrice
+        # cam_transform_in_world = transform_from_rotation_translation(orientation[None, :], position[None, :])
+        cam_transform_in_world = transform_from_rot_trans(orientation[None, :], position[None, :])
+        depth_img = torch.tensor(depth_img, dtype=torch.float32, device=device)
+        
+        batch_size = 1
+        pixel_coords = generate_pixel_coords(self.width, self.height, device, self.shift_pixel)         # ([640, 640, 3])
+        
+        # Separate the indices into row and column indices
+        leftmost_index = keypt_dict['obstacle_points_left']
+        rightmost_index = keypt_dict['obstacle_points_right']
+        # print("leftmost_index and rightmost_index are",leftmost_index, rightmost_index)
+        
+        # Use the indices to extract elements from pixel_coords
+        left_obstacle_cam_coords = pixel_coords[leftmost_index[0], leftmost_index[1]].view(-1, 3) @ torch.inverse(self.intrinsics).t().type(torch.float32)
+        left_obstacle_depth = depth_img[leftmost_index[0], leftmost_index[1]].view(1, -1)
+        left_obstacle_cam = (left_obstacle_cam_coords * left_obstacle_depth.unsqueeze(-1)).view(batch_size, -1, 3)
+        left_obstacle_wf = transform_points_cam_to_world_my(left_obstacle_cam, cam_transform_in_world, self.arm_type).cpu()
+        
+        # Use the indices to extract elements from pixel_coords
+        right_obstacle_cam_coords = pixel_coords[rightmost_index[0], rightmost_index[1]].view(-1, 3) @ torch.inverse(self.intrinsics).t().type(torch.float32)
+        right_obstacle_depth = depth_img[rightmost_index[0], rightmost_index[1]].view(1, -1)
+        right_obstacle_cam = (right_obstacle_cam_coords * right_obstacle_depth.unsqueeze(-1)).view(batch_size, -1, 3)
+        right_obstacle_wf = transform_points_cam_to_world_my(right_obstacle_cam, cam_transform_in_world, self.arm_type).cpu()
+        
+        # print("left_obstacle_wf are ", left_obstacle_wf)
+        # print("right_obstacle_wf are ", right_obstacle_wf)
+        
+        # Extracting the first row from each tensor and converting to numpy arrays
+        left_obstacle_np = left_obstacle_wf[0].numpy()  # Result: array([[ 0.4894, -0.1412, 1.1822]])
+        right_obstacle_np = right_obstacle_wf[0].numpy()  # Result: array([[ 0.4834, -0.1412, 1.1739]])
+        
+        # Combine them into a single numpy array
+        combined_array = np.vstack((left_obstacle_np, right_obstacle_np))
+        return combined_array
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+if __name__ == '__main__':
+    rospy.init_node('realsense_yolo_processor', anonymous=True)
+    tmp_mp = MyPerceiver()
+    tmp_mp.run()
+    # tmp_mp.netwotk_segmentation()    
+    print("Finish my_perceiver.py testing...")
+    # rospy.spin()

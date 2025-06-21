@@ -1,0 +1,12 @@
+train: ../train/images
+val: ../valid/images
+
+nc: 5
+names: ['fruit', 'leaf', 'occludedfruit', 'occludedpeduncle', 'peduncle']
+
+roboflow:
+  workspace: lineojcd
+  project: myvpp
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/lineojcd/myvpp/dataset/1

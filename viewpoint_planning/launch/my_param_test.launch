@@ -1,0 +1,6 @@
+<launch>
+  <param name="model_init_pose" value="0.50 -0.40 -0.04" />
+  <node name="viewpoint_planning" pkg="viewpoint_planning" type="my_param_test.py" output="screen">
+  </node>
+
+</launch>
