@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="jaco2_with_d435">
+  <!-- original j2n6s300.xacro -->
+  <xacro:include filename="$(find kinova_description)/urdf/j2n6s300.xacro"/>
+  <!-- realsense -->
+  <xacro:include filename="$(find realsense_ros_gazebo)/xacro/depthcam_d435.xacro"/>
+    <link name="camera_mount_link">
+    </link>
+    <joint name="jaco2_link_6_to_camera_mount_joint" type="fixed">
+	    <!-- X: right Y: up Z: back change camera pose here  -->
+    	    <!-- Adjust this if necessary -->
+	    <!--origin xyz="0.008 -0.015 -0.13" rpy="0 1.57 1.24"/--> 
+	    <!--origin xyz="0.00002 -0.00001 -0.1601" rpy="0 1.57 1.24"/--> 
+	    <origin xyz="0.00002 -0.00001 -0.1601" rpy="0 1.5708 1.24269"/>  
+	    <parent link="j2n6s300_link_6"/> <!-- Adjust the link name if needed -->
+	    <child link="camera_mount_link"/>
+    </joint>  
+ <xacro:realsense_d435 sensor_name="d435" parent_link="camera_mount_link" rate="10">
+    <origin rpy="0 0 0 " xyz="0 0 0.5"/>
+  </xacro:realsense_d435>
+</robot>
+
