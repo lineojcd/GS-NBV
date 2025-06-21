@@ -40,11 +40,7 @@ conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cud
 #Install Python packages for yolov8
 cd ~/Downloads/GSNBV/viewpoint_planning/src/perception/ultralytics_yolov8
 pip install -e .
-
 ```
-
-
-
 **Compile**
 ```
 cd ~/Downloads
@@ -53,7 +49,6 @@ rm -rf GSNBV
 cd ~/gsnbv_ws/
 catkin build
 ```
-
 **Execute**
 ```
 # In the 1st terminal: launch Kinova arm
@@ -62,9 +57,6 @@ roslaunch kinova_gazebo my_robot_launch.launch
 conda activate gsnbv
 roslaunch viewpoint_planning viewpoint_planning.launch
 ```
-
-
-
 ## Citation
 ```bibtex
 @article{burusa2023gradient,
