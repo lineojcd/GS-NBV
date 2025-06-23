@@ -12,7 +12,7 @@
   <a href="https://arxiv.org/pdf/2311.16759" target="_blank">ArXiv</a>
 </h2>
 
-https://github.com/akshaykburusa/gradientnbv/assets/127020264/dfa1f2a9-f07c-4af0-84ef-7ea20a7cb61b
+[https://github.com/akshaykburusa/gradientnbv/assets/127020264/dfa1f2a9-f07c-4af0-84ef-7ea20a7cb61b](https://github.com/lineojcd/GSNBV/blob/main/assets/gsnbv_group1_demo.mp4)
 
 
 This is the offical repository for the CASE 2025 paper: "GS-NBV: a Geometry-based, Semantics-aware Viewpoint Planning Algorithm for Avocado Harvesting under Occlusions"
