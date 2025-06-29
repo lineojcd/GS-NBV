@@ -8,8 +8,8 @@
 </p>
 <h2 align="center">
   Paper: 
-  <a href="https://arxiv.org/pdf/2311.16759" target="_blank">IEEE</a> | 
-  <a href="https://arxiv.org/pdf/2311.16759" target="_blank">ArXiv</a>
+  <a href="https://arxiv.org/pdf/2506.6581170" target="_blank">IEEE</a> | 
+  <a href="https://arxiv.org/pdf/2506.6581170" target="_blank">ArXiv</a>
 </h2>
 
 [GSNBV Demo](https://github.com/lineojcd/GSNBV/blob/main/assets/gsnbv_group1_demo.mp4)
