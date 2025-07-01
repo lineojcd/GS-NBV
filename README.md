@@ -84,10 +84,14 @@ roslaunch viewpoint_planning viewpoint_planning.launch
 ## Citation
 If you use this repository, please cite below:
 ```bibtex
-@article{burusa2023gradient,
-  title={Gradient-based Local Next-best-view Planning for Improved Perception of Targeted Plant Nodes},
-  author={Burusa, Akshay K and van Henten, Eldert J and Kootstra, Gert},
-  journal={arXiv preprint arXiv:2311.16759},
-  year={2024}
+@misc{song2025gsnbv,
+    title={GS-NBV: a Geometry-based, Semantics-aware Viewpoint Planning Algorithm for Avocado Harvesting under Occlusions},
+    author={Xiao'ao Song and Konstantinos Karydis},
+    year={2025},
+    eprint={2506.23369},
+    archivePrefix={arXiv},
+    primaryClass={cs.RO}
 }
 ```
+## Acknowledgements
+We would like to thank the author of [gradientnbv](https://github.com/akshaykburusa/gradientnbv) for open-sourcing their project.
